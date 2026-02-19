@@ -1,11 +1,9 @@
 #ifndef VISUALIZER_HPP
 #define VISUALIZER_HPP
 
-#include "gcopter/trajectory.hpp"
 #include "SplineTrajectory/SplineTrajectory.hpp"
-#include "SplineTrajectory/SplineTrajectory.hpp"
-#include "gcopter/quickhull.hpp"
 #include "gcopter/geo_utils.hpp"
+#include "gcopter/quickhull.hpp"
 
 #include <iostream>
 #include <memory>
@@ -56,111 +54,6 @@ public:
         thrPub = nh.advertise<std_msgs::Float64>("/visualizer/total_thrust", 1000);
         tiltPub = nh.advertise<std_msgs::Float64>("/visualizer/tilt_angle", 1000);
         bdrPub = nh.advertise<std_msgs::Float64>("/visualizer/body_rate", 1000);
-    }
-
-    // Visualize the trajectory and its front-end path
-    template <int D>
-    inline void visualize(const Trajectory<D> &traj,
-                          const std::vector<Eigen::Vector3d> &route)
-    {
-        visualization_msgs::Marker routeMarker, wayPointsMarker, trajMarker;
-
-        routeMarker.id = 0;
-        routeMarker.type = visualization_msgs::Marker::LINE_LIST;
-        routeMarker.header.stamp = ros::Time::now();
-        routeMarker.header.frame_id = "odom";
-        routeMarker.pose.orientation.w = 1.00;
-        routeMarker.action = visualization_msgs::Marker::ADD;
-        routeMarker.ns = "route";
-        routeMarker.color.r = 1.00;
-        routeMarker.color.g = 0.00;
-        routeMarker.color.b = 0.00;
-        routeMarker.color.a = 1.00;
-        routeMarker.scale.x = 0.1;
-
-        wayPointsMarker = routeMarker;
-        wayPointsMarker.id = -wayPointsMarker.id - 1;
-        wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
-        wayPointsMarker.ns = "waypoints";
-        wayPointsMarker.color.r = 1.00;
-        wayPointsMarker.color.g = 0.00;
-        wayPointsMarker.color.b = 0.00;
-        wayPointsMarker.scale.x = 0.35;
-        wayPointsMarker.scale.y = 0.35;
-        wayPointsMarker.scale.z = 0.35;
-
-        trajMarker = routeMarker;
-        trajMarker.header.frame_id = "odom";
-        trajMarker.id = 0;
-        trajMarker.ns = "trajectory";
-        trajMarker.color.r = 0.00;
-        trajMarker.color.g = 0.50;
-        trajMarker.color.b = 1.00;
-        trajMarker.scale.x = 0.30;
-
-        if (route.size() > 0)
-        {
-            bool first = true;
-            Eigen::Vector3d last;
-            for (auto it : route)
-            {
-                if (first)
-                {
-                    first = false;
-                    last = it;
-                    continue;
-                }
-                geometry_msgs::Point point;
-
-                point.x = last(0);
-                point.y = last(1);
-                point.z = last(2);
-                routeMarker.points.push_back(point);
-                point.x = it(0);
-                point.y = it(1);
-                point.z = it(2);
-                routeMarker.points.push_back(point);
-                last = it;
-            }
-
-            routePub.publish(routeMarker);
-        }
-
-        if (traj.getPieceNum() > 0)
-        {
-            Eigen::MatrixXd wps = traj.getPositions();
-            for (int i = 0; i < wps.cols(); i++)
-            {
-                geometry_msgs::Point point;
-                point.x = wps.col(i)(0);
-                point.y = wps.col(i)(1);
-                point.z = wps.col(i)(2);
-                wayPointsMarker.points.push_back(point);
-            }
-
-            wayPointsPub.publish(wayPointsMarker);
-        }
-
-        if (traj.getPieceNum() > 0)
-        {
-            double T = 0.01;
-            Eigen::Vector3d lastX = traj.getPos(0.0);
-            for (double t = T; t < traj.getTotalDuration(); t += T)
-            {
-                geometry_msgs::Point point;
-                Eigen::Vector3d X = traj.getPos(t);
-                point.x = lastX(0);
-                point.y = lastX(1);
-                point.z = lastX(2);
-                trajMarker.points.push_back(point);
-                point.x = X(0);
-                point.y = X(1);
-                point.z = X(2);
-                trajMarker.points.push_back(point);
-                lastX = X;
-            }
-            trajectoryPub.publish(trajMarker);
-        }
     }
 
     inline void visualize(const SplineTrajectory::QuinticSpline3D &spline,

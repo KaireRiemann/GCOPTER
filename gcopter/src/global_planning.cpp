@@ -1,5 +1,5 @@
 #include "misc/visualizer.hpp"
-#include "gcopter/gcopter.hpp"
+#include "gcopter/spline_sfc_optimizer.hpp"
 #include "gcopter/firi.hpp"
 #include "gcopter/flatness.hpp"
 #include "gcopter/voxel_map.hpp"
@@ -173,7 +173,7 @@ public:
                 iniState << route.front(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
                 finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
 
-                gcopter::GCOPTER_PolytopeSFC gcopter;
+                gcopter::SplineSFCOptimizer gcopter;
 
                 // magnitudeBounds = [v_max, omg_max, theta_max, thrust_min, thrust_max]^T
                 // penaltyWeights = [pos_weight, vel_weight, omg_weight, theta_weight, thrust_weight]^T

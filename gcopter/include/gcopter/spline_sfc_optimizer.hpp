@@ -371,7 +371,7 @@ namespace gcopter
         lbfgs::lbfgs_parameter_t lbfgs_params_{};
 
         std::vector<double> ref_times_;
-        SplineTrajectory::SplineVector<Eigen::Vector3d> ref_waypoints_;
+        typename OptimizerType::WaypointsType ref_waypoints_;
         SplineTrajectory::BoundaryConditions<3> ref_bc_;
 
     private:
@@ -701,18 +701,17 @@ namespace gcopter
             optimizer_.setEnergyWeights(1.0);
             optimizer_.setIntegralNumSteps(integralRes_);
 
-            SplineTrajectory::SplineVector<Eigen::Vector3d> waypoints;
-            waypoints.reserve(pieceN_ + 1);
-            waypoints.push_back(headPVA_.col(0));
+            typename OptimizerType::WaypointsType waypoints(pieceN_ + 1, 3);
+            waypoints.row(0) = headPVA_.col(0).transpose();
 
             Eigen::Matrix3Xd innerPoints;
             Eigen::VectorXd timeAlloc;
             setInitial(shortPath_, allocSpeed_, pieceIdx_, innerPoints, timeAlloc);
             for (int i = 0; i < innerPoints.cols(); ++i)
             {
-                waypoints.push_back(innerPoints.col(i));
+                waypoints.row(i + 1) = innerPoints.col(i).transpose();
             }
-            waypoints.push_back(tailPVA_.col(0));
+            waypoints.row(pieceN_) = tailPVA_.col(0).transpose();
 
             SplineTrajectory::BoundaryConditions<3> bc;
             bc.start_velocity = headPVA_.col(1);
