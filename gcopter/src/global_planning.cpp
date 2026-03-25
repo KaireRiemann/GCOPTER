@@ -4,6 +4,7 @@
 #include "gcopter/flatness.hpp"
 #include "gcopter/voxel_map.hpp"
 #include "gcopter/sfc_gen.hpp"
+#include "gcopter/gcopter.hpp"
 #include "SplineTrajectory/SplineTrajectory.hpp"
 #include "NUBSTrajectory/NUBSTrajectory.hpp"
 #include "gcopter/nubs_sfc_optimizer.hpp"
@@ -91,6 +92,7 @@ private:
 
     SplineTrajectory::QuinticSpline3D spline_traj;
     nubs::NUBSTrajectory<3> nubs_traj;
+    Trajectory<5> traj;
     double trajStamp;
 
 public:
@@ -178,6 +180,7 @@ public:
                 iniState << route.front(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
                 finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
 
+                gcopter::GCOPTER_PolytopeSFC minco_opt;
                 gcopter::SplineSFCOptimizer spline_opt;
                 gcopter::NUBSSFCOptimizer nubs_opt;
 
@@ -208,6 +211,34 @@ public:
                 const int quadratureRes = config.integralIntervs;
 
                 spline_traj = SplineTrajectory::QuinticSpline3D();
+                traj.clear();
+
+                auto t_m1 = std::chrono::high_resolution_clock::now();
+                if (!minco_opt.setup(config.weightT,
+                                   iniState, finState,
+                                   hPolys, INFINITY,
+                                   config.smoothingEps,
+                                   quadratureRes,
+                                   magnitudeBounds,
+                                   penaltyWeights,
+                                   physicalParams))
+                {
+                    return;
+                }
+
+                if (std::isinf(minco_opt.optimize(traj, config.relCostTol)))
+                {
+                    return;
+                }
+                auto t_m2 = std::chrono::high_resolution_clock::now();
+                double t_m = std::chrono::duration_cast<std::chrono::milliseconds>(t_m2-t_m1).count();
+                std::cout<<"minco trajectory optimize time : "<<t_m<<" ms"<<std::endl;
+
+                if (traj.getPieceNum() > 0)
+                {
+                    trajStamp = ros::Time::now().toSec();
+                    visualizer.visualize(traj, route);
+                }
 
                 auto t1 = std::chrono::high_resolution_clock::now();
                 if (!spline_opt.setup(config.weightT,
@@ -311,16 +342,16 @@ public:
         flatmap.reset(physicalParams(0), physicalParams(1), physicalParams(2),
                       physicalParams(3), physicalParams(4), physicalParams(5));
 
-        if (traj.isInitialized() && traj.getNumSegments() > 0)
+        if (spline_traj.isInitialized() && spline_traj.getNumSegments() > 0)
         {
             const double delta = ros::Time::now().toSec() - trajStamp;
-            if (delta > 0.0 && delta < traj.getDuration())
+            if (delta > 0.0 && delta < spline_traj.getDuration())
             {
                 double thr;
                 Eigen::Vector4d quat;
                 Eigen::Vector3d omg;
 
-                const auto &ppoly = traj.getTrajectory();
+                const auto &ppoly = spline_traj.getTrajectory();
                 const Eigen::Vector3d vel = ppoly.evaluate(delta, SplineTrajectory::Deriv::Vel);
                 const Eigen::Vector3d acc = ppoly.evaluate(delta, SplineTrajectory::Deriv::Acc);
                 const Eigen::Vector3d jer = ppoly.evaluate(delta, SplineTrajectory::Deriv::Jerk);

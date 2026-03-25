@@ -2,7 +2,10 @@
 #define NUBS_SFC_OPTIMIZER_HPP
 
 #include "NUBSTrajectory/NUBSOptimizer.hpp" 
+#include "TrajectoryOptComponents/LinearTimeCost.hpp"
 #include "TrajectoryOptComponents/SFCCommonTypes.hpp"
+#include "TrajectoryOptComponents/SFCControlPointsCosts.hpp"
+#include "TrajectoryOptComponents/IdentitySpatialMap.hpp"
 #include "gcopter/geo_utils.hpp"
 #include "gcopter/lbfgs.hpp"
 
@@ -15,130 +18,6 @@
 
 namespace gcopter
 {
-    struct NUBSTimeCost
-    {
-        double weight = 1.0;
-
-        double operator()(const std::vector<double> &T, Eigen::VectorXd &gdT) const
-        {
-            double cost = 0.0;
-            gdT.setZero(T.size());
-            for (size_t i = 0; i < T.size(); ++i)
-            {
-                cost += weight * T[i];
-                gdT(i) = weight;
-            }
-            return cost;
-        }
-    };
-
-    /**
-     * @brief 基于控制点的碰撞惩罚以及动力学限幅惩罚代价 
-     */
-    struct SFCControlPointCost
-    {
-        double max_v, max_thrust;
-        double weight_v, weight_thrust;
-        double smooth_eps;
-        Eigen::Vector3d gravity;
-        using PolyhedraH = std::vector<Eigen::MatrixX4d>;
-
-        double weight_pos;
-        const PolyhedraH* hPolys; 
-        std::vector<std::vector<int>> cp_to_polys; 
-
-        SFCControlPointCost() : gravity(0.0, 0.0, 9.81), hPolys(nullptr), weight_pos(10000.0), smooth_eps(0.1) {}
-
-        // 平滑 L1 惩罚：大数值时呈现线性，防止梯度爆炸
-        inline bool smoothedL1(double x, double& pena, double& penaD) const
-        {
-            if (x <= 0.0) return false;
-            if (x > smooth_eps) {
-                pena = x - smooth_eps / 2.0;
-                penaD = 1.0;
-            } else {
-                pena = x * x / (2.0 * smooth_eps);
-                penaD = x / smooth_eps;
-            }
-            return true;
-        }
-
-        void operator()(const Eigen::MatrixXd &C,
-                        const Eigen::MatrixXd &V, 
-                        const Eigen::MatrixXd &A, 
-                        const Eigen::MatrixXd &J,
-                        double &cost, 
-                        Eigen::MatrixXd &gdC,
-                        Eigen::MatrixXd &gdV, 
-                        Eigen::MatrixXd &gdA, 
-                        Eigen::MatrixXd &gdJ) const
-        {
-            // 1. 走廊位置约束惩罚
-            if (hPolys != nullptr && !cp_to_polys.empty())
-            {
-                for (int i = 0; i < C.rows(); ++i)
-                {
-                    if (i >= cp_to_polys.size()) break;
-                    Eigen::Vector3d pos = C.row(i).transpose();
-                    
-                    for (int L : cp_to_polys[i])
-                    {
-                        if (L < 0 || L >= hPolys->size()) continue;
-                        const auto& poly = (*hPolys)[L];
-                        int K = poly.rows();
-                        
-                        for (int k = 0; k < K; ++k)
-                        {
-                            Eigen::Vector3d outerNormal = poly.block<1, 3>(k, 0).transpose();
-                            double d = poly(k, 3);
-                            double violaPos = outerNormal.dot(pos) + d;
-                            
-                            double pena = 0.0, penaD = 0.0;
-                            if (smoothedL1(violaPos, pena, penaD))
-                            {
-                                cost += weight_pos * pena; 
-                                gdC.row(i) += weight_pos * penaD * outerNormal.transpose();
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. 速度限幅惩罚
-            for (int i = 0; i < V.rows(); ++i)
-            {
-                double v_norm = V.row(i).norm();
-                if (v_norm > max_v)
-                {
-                    double diff = v_norm - max_v;
-                    double pena = 0.0, penaD = 0.0;
-                    if (smoothedL1(diff, pena, penaD))
-                    {
-                        cost += weight_v * pena; 
-                        gdV.row(i) += weight_v * penaD * (V.row(i) / v_norm);
-                    }
-                }
-            }
-
-            // 3. 推力限幅惩罚
-            for (int i = 0; i < A.rows(); ++i)
-            {
-                Eigen::Vector3d thr = A.row(i).transpose() + gravity;
-                double t_norm = thr.norm();
-                if (t_norm > max_thrust)
-                {
-                    double diff = t_norm - max_thrust;
-                    double pena = 0.0, penaD = 0.0;
-                    if (smoothedL1(diff, pena, penaD))
-                    {
-                        cost += weight_thrust * pena;
-                        gdA.row(i) += weight_thrust * penaD * (thr.transpose() / t_norm);
-                    }
-                }
-            }
-        }
-    };
-
     class NUBSSFCOptimizer
     {
     public:
@@ -464,12 +343,9 @@ namespace gcopter
             }
 
             spatial_map_.reset(&vPolytopes_, &vPolyIdx_, pieceN_);
-            optimizer_.setSpatialMap(spatial_map_);
+            optimizer_.setSpatialMap(&spatial_map_);
             
-            // 设置底层轨迹的能量代价权重 (例如 minimum jerk 的权重)
             optimizer_.setEnergyWeights(1.0); 
-
-            // 4. 初值提取与参数配置
             Eigen::MatrixXd waypoints(pieceN_ + 1, 3);
             waypoints.row(0) = headState_.col(0).transpose();
 

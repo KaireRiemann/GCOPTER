@@ -258,13 +258,16 @@ namespace nubs
     private:
         TrajType traj_;
         int num_segments_ = 0;
-        int s_ = 0; // 系统偏好的连续阶数，如 s=3 则代表最小化 Jerk
+        int s_ = 0;
         
         std::vector<double> ref_times_;
         MatrixType ref_waypoints_;
         
-        TimeMap time_map_;
-        SpatialMap spatial_map_;
+        TimeMap default_time_map_;
+        SpatialMap default_spatial_map_;
+        
+        const TimeMap* active_time_map_ = nullptr;
+        const SpatialMap* active_spatial_map_ = nullptr;
         
         mutable std::unique_ptr<Workspace> ws_;
         double rho_energy_ = 1.0; 
@@ -278,8 +281,15 @@ namespace nubs
         }
 
         void setEnergyWeights(double rho) { rho_energy_ = rho; }
-        void setTimeMap(const TimeMap& tm) { time_map_ = tm; }
-        void setSpatialMap(const SpatialMap& sm) { spatial_map_ = sm; }
+        void setTimeMap(const TimeMap* tm) 
+        { 
+            active_time_map_ = (tm != nullptr) ? tm : &default_time_map_; 
+        
+        }
+        void setSpatialMap(const SpatialMap* sm) 
+        { 
+            active_spatial_map_ = (sm != nullptr) ? sm : &default_spatial_map_;
+        }
 
         /**
          * @brief 初始化参考状态 (航路点, 时间段, 以及首尾状态如 P,V,A)
@@ -311,26 +321,26 @@ namespace nubs
         }
 
         /**
-         * @brief 提取当前状态并将其映射到无约束参数空间 (L-BFGS 初值)
+         * @brief 提取当前状态并将其映射到无约束参数空间
          */
         Eigen::VectorXd generateInitialGuess() const
         {
             int dim_T = num_segments_;
             int dim_P = 0;
             for (int i = 1; i < num_segments_; ++i) {
-                dim_P += spatial_map_.getUnconstrainedDim(i);
+                dim_P += active_spatial_map_->getUnconstrainedDim(i);
             }
 
             Eigen::VectorXd x(dim_T + dim_P);
 
             for (int i = 0; i < num_segments_; ++i) {
-                x(i) = time_map_.toTau(ref_times_[i]);
+                x(i) = active_time_map_->toTau(ref_times_[i]);
             }
 
             int offset = dim_T;
             for (int i = 1; i < num_segments_; ++i) {
-                int dof = spatial_map_.getUnconstrainedDim(i);
-                x.segment(offset, dof) = spatial_map_.toUnconstrained(ref_waypoints_.row(i).transpose(), i);
+                int dof = active_spatial_map_->getUnconstrainedDim(i);
+                x.segment(offset, dof) = active_spatial_map_->toUnconstrained(ref_waypoints_.row(i).transpose(), i);
                 offset += dof;
             }
 
@@ -338,7 +348,7 @@ namespace nubs
         }
 
         /**
-         * @brief Evaluate 函数，链接一切：约束消除 -> 轨道生成 -> 代价评估 -> 梯度反传
+         * @brief Evaluate，约束消除 -> 轨迹生成 -> 代价评估 -> 梯度反传
          */
         template <typename TimeCostFunc, typename ControlPointCostFunc>
         double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
@@ -353,18 +363,18 @@ namespace nubs
 
             for (int i = 0; i < num_segments_; ++i) 
             {
-                ws_->cache_T(i) = time_map_.toTime(x(i));
+                ws_->cache_T(i) = active_time_map_->toTime(x(i));
             }
 
             int offset = num_segments_;
             for (int i = 1; i < num_segments_; ++i) 
             {
-                int dof = spatial_map_.getUnconstrainedDim(i);
+                int dof = active_spatial_map_->getUnconstrainedDim(i);
                 Eigen::VectorXd xi = x.segment(offset, dof);
-                ws_->cache_P_inner.row(i - 1) = spatial_map_.toPhysical(xi, i).transpose();
+                ws_->cache_P_inner.row(i - 1) = active_spatial_map_->toPhysical(xi, i).transpose();
                 
                 Eigen::VectorXd grad_xi = Eigen::VectorXd::Zero(dof);
-                spatial_map_.addNormPenalty(xi, total_cost, grad_xi);
+                active_spatial_map_->addNormPenalty(xi, total_cost, grad_xi);
                 grad_out.segment(offset, dof) += grad_xi;
 
                 offset += dof;
@@ -411,14 +421,14 @@ namespace nubs
 
             for (int i = 0; i < num_segments_; ++i) 
             {
-                grad_out(i) += time_map_.backward(x(i), ws_->cache_T(i), ws_->gradByTimes(i));
+                grad_out(i) += active_time_map_->backward(x(i), ws_->cache_T(i), ws_->gradByTimes(i));
             }
 
             offset = num_segments_;
             for (int i = 1; i < num_segments_; ++i) {
-                int dof = spatial_map_.getUnconstrainedDim(i);
+                int dof = active_spatial_map_->getUnconstrainedDim(i);
                 Eigen::Matrix<double, DIM, 1> grad_p = ws_->gradByPoints.row(i - 1).transpose();
-                grad_out.segment(offset, dof) += spatial_map_.backwardGrad(x.segment(offset, dof), grad_p, i);
+                grad_out.segment(offset, dof) += active_spatial_map_->backwardGrad(x.segment(offset, dof), grad_p, i);
                 offset += dof;
             }
 
