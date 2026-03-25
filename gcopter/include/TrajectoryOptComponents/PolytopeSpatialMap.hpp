@@ -105,6 +105,16 @@ struct PolytopeSpatialMap
         return grad_xi;
     }
 
+    void addNormPenalty(const Eigen::VectorXd& xi, double& cost, Eigen::VectorXd& grad_xi) const 
+    {
+        double sqrNormViolation = xi.squaredNorm() - 1.0;
+        if (sqrNormViolation > 0.0) {
+            double c = sqrNormViolation * sqrNormViolation;
+            cost += c * sqrNormViolation; 
+            grad_xi += (3.0 * c) * 2.0 * xi;
+        }
+    }
+
 private:
     static inline double costTinyNLS(void *ptr,
                                      const Eigen::VectorXd &xi,

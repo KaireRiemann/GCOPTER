@@ -2,6 +2,7 @@
 #define VISUALIZER_HPP
 
 #include "SplineTrajectory/SplineTrajectory.hpp"
+#include "NUBSTrajectory/NUBSTrajectory.hpp" 
 #include "gcopter/geo_utils.hpp"
 #include "gcopter/quickhull.hpp"
 
@@ -67,7 +68,7 @@ public:
         routeMarker.header.frame_id = "odom";
         routeMarker.pose.orientation.w = 1.00;
         routeMarker.action = visualization_msgs::Marker::ADD;
-        routeMarker.ns = "route";
+        routeMarker.ns = "minco_route"; // 修改命名空间
         routeMarker.color.r = 1.00;
         routeMarker.color.g = 0.00;
         routeMarker.color.b = 0.00;
@@ -75,9 +76,9 @@ public:
         routeMarker.scale.x = 0.1;
 
         wayPointsMarker = routeMarker;
-        wayPointsMarker.id = -wayPointsMarker.id - 1;
+        wayPointsMarker.id = 0; // 修正 ID
         wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
-        wayPointsMarker.ns = "waypoints";
+        wayPointsMarker.ns = "spline_waypoints"; // 修改命名空间
         wayPointsMarker.color.r = 1.00;
         wayPointsMarker.color.g = 0.00;
         wayPointsMarker.color.b = 0.00;
@@ -86,9 +87,9 @@ public:
         wayPointsMarker.scale.z = 0.35;
 
         trajMarker = routeMarker;
-        trajMarker.header.frame_id = "odom";
         trajMarker.id = 0;
-        trajMarker.ns = "trajectory";
+        trajMarker.ns = "spline_trajectory"; // 修改命名空间
+        // MINCO 轨迹：蓝色
         trajMarker.color.r = 0.00;
         trajMarker.color.g = 0.50;
         trajMarker.color.b = 1.00;
@@ -107,18 +108,12 @@ public:
                     continue;
                 }
                 geometry_msgs::Point point;
-
-                point.x = last(0);
-                point.y = last(1);
-                point.z = last(2);
+                point.x = last(0); point.y = last(1); point.z = last(2);
                 routeMarker.points.push_back(point);
-                point.x = it(0);
-                point.y = it(1);
-                point.z = it(2);
+                point.x = it(0); point.y = it(1); point.z = it(2);
                 routeMarker.points.push_back(point);
                 last = it;
             }
-
             routePub.publish(routeMarker);
         }
 
@@ -128,12 +123,9 @@ public:
             for (int i = 0; i < wps.rows(); i++)
             {
                 geometry_msgs::Point point;
-                point.x = wps(i, 0);
-                point.y = wps(i, 1);
-                point.z = wps(i, 2);
+                point.x = wps(i, 0); point.y = wps(i, 1); point.z = wps(i, 2);
                 wayPointsMarker.points.push_back(point);
             }
-
             wayPointsPub.publish(wayPointsMarker);
         }
 
@@ -147,14 +139,108 @@ public:
             {
                 geometry_msgs::Point point;
                 Eigen::Vector3d X = spline.getTrajectory().evaluate(t);
-                point.x = lastX(0);
-                point.y = lastX(1);
-                point.z = lastX(2);
+                point.x = lastX(0); point.y = lastX(1); point.z = lastX(2);
                 trajMarker.points.push_back(point);
-                point.x = X(0);
-                point.y = X(1);
-                point.z = X(2);
+                point.x = X(0); point.y = X(1); point.z = X(2);
                 trajMarker.points.push_back(point);
+                lastX = X;
+            }
+            trajectoryPub.publish(trajMarker);
+        }
+    }
+
+    inline void visualize(const nubs::NUBSTrajectory<3, 7> &traj,
+                          const std::vector<Eigen::Vector3d> &route)
+    {
+        visualization_msgs::Marker routeMarker, wayPointsMarker, trajMarker;
+        routeMarker.id = 0;
+        routeMarker.type = visualization_msgs::Marker::LINE_LIST;
+        routeMarker.header.stamp = ros::Time::now();
+        routeMarker.header.frame_id = "odom"; 
+        routeMarker.pose.orientation.w = 1.00;
+        routeMarker.action = visualization_msgs::Marker::ADD;
+        routeMarker.ns = "nubs_route"; 
+        routeMarker.color.r = 1.00;
+        routeMarker.color.g = 0.00;
+        routeMarker.color.b = 0.00;
+        routeMarker.color.a = 0.50; // 设为半透明避免完全遮挡
+        routeMarker.scale.x = 0.1;
+
+        // 2. 渲染控制点 (Control Points)
+        wayPointsMarker = routeMarker;
+        wayPointsMarker.id = 0;
+        wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
+        wayPointsMarker.ns = "nubs_control_points"; // 独立命名空间
+        // NUBS 控制点：鲜艳的橙色，方便观察保凸性
+        wayPointsMarker.color.r = 1.00;
+        wayPointsMarker.color.g = 0.50;
+        wayPointsMarker.color.b = 0.00;
+        wayPointsMarker.color.a = 1.00;
+        wayPointsMarker.scale.x = 0.40;
+        wayPointsMarker.scale.y = 0.40;
+        wayPointsMarker.scale.z = 0.40;
+
+        trajMarker = routeMarker;
+        trajMarker.id = 0;
+        trajMarker.ns = "nubs_trajectory"; // 独立命名空间
+        // NUBS 轨迹：亮绿色
+        trajMarker.color.r = 0.00;
+        trajMarker.color.g = 1.00;
+        trajMarker.color.b = 0.00;
+        trajMarker.color.a = 1.00;
+        trajMarker.scale.x = 0.35; // 稍微加粗一点，方便和蓝线对比
+
+        if (route.size() > 0)
+        {
+            bool first = true;
+            Eigen::Vector3d last;
+            for (auto it : route)
+            {
+                if (first) { first = false; last = it; continue; }
+                geometry_msgs::Point point;
+                point.x = last(0); point.y = last(1); point.z = last(2);
+                routeMarker.points.push_back(point);
+                point.x = it(0); point.y = it(1); point.z = it(2);
+                routeMarker.points.push_back(point);
+                last = it;
+            }
+            // routePub.publish(routeMarker); // 可选：如果觉得红线重叠，这行可以注释掉
+        }
+
+        // --- 填充控制点数据 ---
+        if (traj.getKnots().size() > 0)
+        {
+            const auto &cps = traj.getControlPoints();
+            for (int i = 0; i < cps.rows(); i++)
+            {
+                geometry_msgs::Point point;
+                point.x = cps(i, 0);
+                point.y = cps(i, 1);
+                point.z = cps(i, 2);
+                wayPointsMarker.points.push_back(point);
+            }
+            wayPointsPub.publish(wayPointsMarker);
+        }
+
+        // --- 填充轨迹曲线数据 ---
+        if (traj.getKnots().size() > 0)
+        {
+            const double T_step = 0.05; // 采样步长
+            const double t_start = 0.0;
+            const double t_end = traj.getTotalDuration();
+            Eigen::Vector3d lastX = traj.evaluate(t_start, 0); 
+
+            for (double t = t_start + T_step; t < t_end; t += T_step)
+            {
+                geometry_msgs::Point point;
+                Eigen::Vector3d X = traj.evaluate(t, 0);
+
+                point.x = lastX(0); point.y = lastX(1); point.z = lastX(2);
+                trajMarker.points.push_back(point);
+
+                point.x = X(0); point.y = X(1); point.z = X(2);
+                trajMarker.points.push_back(point);
+
                 lastX = X;
             }
             trajectoryPub.publish(trajMarker);

@@ -5,6 +5,8 @@
 #include "gcopter/voxel_map.hpp"
 #include "gcopter/sfc_gen.hpp"
 #include "SplineTrajectory/SplineTrajectory.hpp"
+#include "NUBSTrajectory/NUBSTrajectory.hpp"
+#include "gcopter/nubs_sfc_optimizer.hpp"
 
 #include <ros/ros.h>
 #include <ros/console.h>
@@ -86,7 +88,9 @@ private:
     Visualizer visualizer;
     std::vector<Eigen::Vector3d> startGoal;
 
-    SplineTrajectory::QuinticSpline3D traj;
+
+    SplineTrajectory::QuinticSpline3D spline_traj;
+    nubs::NUBSTrajectory<3> nubs_traj;
     double trajStamp;
 
 public:
@@ -163,7 +167,8 @@ public:
                                  3.0,
                                  hPolys);
             sfc_gen::shortCut(hPolys);
-
+            
+            
             if (route.size() > 1)
             {
                 visualizer.visualizePolytope(hPolys);
@@ -173,7 +178,8 @@ public:
                 iniState << route.front(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
                 finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
 
-                gcopter::SplineSFCOptimizer gcopter;
+                gcopter::SplineSFCOptimizer spline_opt;
+                gcopter::NUBSSFCOptimizer nubs_opt;
 
                 // magnitudeBounds = [v_max, omg_max, theta_max, thrust_min, thrust_max]^T
                 // penaltyWeights = [pos_weight, vel_weight, omg_weight, theta_weight, thrust_weight]^T
@@ -201,9 +207,10 @@ public:
                 physicalParams(5) = config.speedEps;
                 const int quadratureRes = config.integralIntervs;
 
-                traj = SplineTrajectory::QuinticSpline3D();
+                spline_traj = SplineTrajectory::QuinticSpline3D();
 
-                if (!gcopter.setup(config.weightT,
+                auto t1 = std::chrono::high_resolution_clock::now();
+                if (!spline_opt.setup(config.weightT,
                                    iniState, finState,
                                    hPolys, INFINITY,
                                    config.smoothingEps,
@@ -215,17 +222,51 @@ public:
                     return;
                 }
 
-                if (std::isinf(gcopter.optimize(traj, config.relCostTol)))
+                if (std::isinf(spline_opt.optimize(spline_traj, config.relCostTol)))
                 {
                     return;
                 }
 
-                if (traj.isInitialized() && traj.getNumSegments() > 0)
+                auto t2 = std::chrono::high_resolution_clock::now();
+                double t = std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
+                std::cout<<"spline trajectory optimize time : "<<t<<" ms"<<std::endl;
+
+
+                auto t3 = std::chrono::high_resolution_clock::now();
+                if (!nubs_opt.setup(config.weightT,
+                                          iniState, finState,
+                                          hPolys, INFINITY,
+                                          config.smoothingEps,
+                                          magnitudeBounds,
+                                          penaltyWeights,
+                                          physicalParams))
+                {
+                    ROS_WARN("NUBS Optimizer Setup Failed!");
+                    return;
+                }
+
+                if (std::isinf(nubs_opt.optimize(nubs_traj, config.relCostTol)))
+                {
+                    ROS_WARN("NUBS Optimization Diverged/Failed!");
+                    return;
+                }
+                auto t4 = std::chrono::high_resolution_clock::now();
+                double t_b = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
+                std::cout<<"nubs trajectory optimize time : "<<t_b<<" ms"<<std::endl;
+
+                if (spline_traj.isInitialized() && spline_traj.getNumSegments() > 0)
                 {
                     trajStamp = ros::Time::now().toSec();
-                    visualizer.visualize(traj, route);
+                    visualizer.visualize(spline_traj, route);
+                }
+
+                if(nubs_traj.getPieceNum() > 0)
+                {
+                    trajStamp = ros::Time::now().toSec();
+                    visualizer.visualize(nubs_traj,route);
                 }
             }
+            
         }
     }
 
