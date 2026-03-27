@@ -286,6 +286,52 @@ public:
         control_points = P_full; 
     }
 
+    inline void generateFromFreeControlPoints(const Eigen::MatrixXd& C_free, 
+                                              const Eigen::MatrixXd& headState, 
+                                              const Eigen::MatrixXd& tailState, 
+                                              const Eigen::VectorXd& T)
+    {
+        int M = T.size();
+        N_c = getCtrlPtNum(M);
+        durations_ = T; 
+        knots = generateKnots(T, N_c);
+        control_points.resize(N_c, Dim);
+
+        A.create(N_c, p, p);
+        Eigen::Matrix<double, MaxP+1, MaxP+1> ders;
+        Eigen::Matrix<double, Eigen::Dynamic, Dim> b = Eigen::Matrix<double, Eigen::Dynamic, Dim>::Zero(N_c, Dim);
+        
+        int row = 0;
+        
+        for (int d = 0; d < s; d++) 
+        {
+            dersBasisFuns(d, p, knots(p), knots, ders);
+            for (int j = 0; j <= p; j++) A(row, j) = ders(d, j);
+            b.row(row) = headState.col(d).transpose();
+            row++;
+        }
+        
+        for (int i = 1; i < M; i++) 
+        {
+            A(row, s + i - 1) = 1.0; 
+            b.row(row) = C_free.row(i - 1);
+            row++;
+        }
+        
+        double t_end = knots(N_c);
+        for (int d = s - 1; d >= 0; d--) 
+        {
+            dersBasisFuns(d, N_c - 1, t_end, knots, ders);
+            for (int j = 0; j <= p; j++) A(row, N_c - 1 - p + j) = ders(d, j);
+            b.row(row) = tailState.col(d).transpose();
+            row++;
+        }
+        
+        A.factorizeLU();
+        A.solve(b);
+        control_points = b; 
+    }
+
     Eigen::Matrix<double, Dim, 1> evaluate(double t, int d_ord = 0) const 
     {
         if (t <= 0.0) t = 0.0;
