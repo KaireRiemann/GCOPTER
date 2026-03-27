@@ -351,15 +351,16 @@ namespace nubs
          * @brief Evaluate，约束消除 -> 轨迹生成 -> 代价评估 -> 梯度反传
          */
         template <typename TimeCostFunc, typename ControlPointCostFunc>
-        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+        double evaluate(const Eigen::Ref<const Eigen::VectorXd>& x, 
+                        Eigen::Ref<Eigen::VectorXd> grad_out,
                         TimeCostFunc &&time_cost_func,
-                        ControlPointCostFunc &&cp_cost_func) 
+                        ControlPointCostFunc &&cp_cost_func)
         {
             static_assert(TypeTraits::HasTimeCostInterface<typename std::decay<TimeCostFunc>::type>::value, 
                           "TimeCostFunc does not satisfy requirements.");
 
             double total_cost = 0.0;
-            grad_out.setZero(x.size());
+            grad_out.setZero();
 
             for (int i = 0; i < num_segments_; ++i) 
             {
@@ -438,7 +439,7 @@ namespace nubs
         const TrajType& getTrajectory() const { return traj_; }
 
         // =========================================================================
-        //  梯度检测工具 (Gradient Checker)
+        //  (Gradient Checker)
         // =========================================================================
         struct GradientCheckResult
         {

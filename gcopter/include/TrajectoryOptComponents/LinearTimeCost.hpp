@@ -38,6 +38,21 @@ namespace gcopter
             return cost;
         }
     };
+
+    struct NUBSTimeCostZO
+    {
+        double weight = 1.0;
+
+        inline double operator()(const std::vector<double> &T) const
+        {
+            double cost = 0.0;
+            for (double t : T)
+            {
+                cost += weight * t;
+            }
+            return cost;
+        }
+    };
 }
 
 #endif

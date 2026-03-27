@@ -234,7 +234,9 @@ public:
     }
 
     inline void visualize(const nubs::NUBSTrajectory<3, 7> &traj,
-                          const std::vector<Eigen::Vector3d> &route)
+                          const std::vector<Eigen::Vector3d> &route,
+                          const std::string &name, 
+                          double r, double g, double b)
     {
         visualization_msgs::Marker routeMarker, wayPointsMarker, trajMarker;
 
@@ -245,71 +247,49 @@ public:
         routeMarker.pose.orientation.w = 1.00;
         routeMarker.action = visualization_msgs::Marker::ADD;
         routeMarker.ns = "route";
-        routeMarker.color.r = 1.00;
-        routeMarker.color.g = 0.00;
-        routeMarker.color.b = 0.00;
-        routeMarker.color.a = 1.00;
+        routeMarker.color.r = 1.00; routeMarker.color.g = 0.00; routeMarker.color.b = 0.00; routeMarker.color.a = 1.00;
         routeMarker.scale.x = 0.1;
 
-        // 2. 渲染控制点 (Control Points)
+        // 控制点
         wayPointsMarker = routeMarker;
         wayPointsMarker.id = 0;
         wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
-        wayPointsMarker.ns = "nubs_control_points"; // 独立命名空间
-        // NUBS 控制点：鲜艳的橙色，方便观察保凸性
-        wayPointsMarker.color.r = 1.00;
-        wayPointsMarker.color.g = 0.50;
-        wayPointsMarker.color.b = 0.00;
-        wayPointsMarker.color.a = 1.00;
-        wayPointsMarker.scale.x = 0.40;
-        wayPointsMarker.scale.y = 0.40;
-        wayPointsMarker.scale.z = 0.40;
+        wayPointsMarker.ns = "nubs_control_points_" + name; // 隔离命名空间
+        wayPointsMarker.color.r = r; wayPointsMarker.color.g = g; wayPointsMarker.color.b = b; wayPointsMarker.color.a = 1.00;
+        wayPointsMarker.scale.x = 0.40; wayPointsMarker.scale.y = 0.40; wayPointsMarker.scale.z = 0.40;
 
+        // 轨迹线
         trajMarker = routeMarker;
         trajMarker.id = 0;
-        trajMarker.ns = "nubs_trajectory"; // 独立命名空间
-        // NUBS 轨迹：亮绿色
-        trajMarker.color.r = 0.00;
-        trajMarker.color.g = 1.00;
-        trajMarker.color.b = 0.00;
-        trajMarker.color.a = 1.00;
-        trajMarker.scale.x = 0.35; // 稍微加粗一点，方便和蓝线对比
+        trajMarker.ns = "nubs_trajectory_" + name; // 隔离命名空间
+        trajMarker.color.r = r; trajMarker.color.g = g; trajMarker.color.b = b; trajMarker.color.a = 1.00;
+        trajMarker.scale.x = 0.35; 
 
-
-        // --- 填充控制点数据 ---
         if (traj.getKnots().size() > 0)
         {
             const auto &cps = traj.getControlPoints();
-            for (int i = 0; i < cps.rows(); i++)
-            {
+            for (int i = 0; i < cps.rows(); i++) {
                 geometry_msgs::Point point;
-                point.x = cps(i, 0);
-                point.y = cps(i, 1);
-                point.z = cps(i, 2);
+                point.x = cps(i, 0); point.y = cps(i, 1); point.z = cps(i, 2);
                 wayPointsMarker.points.push_back(point);
             }
             wayPointsPub.publish(wayPointsMarker);
         }
 
-        // --- 填充轨迹曲线数据 ---
         if (traj.getKnots().size() > 0)
         {
-            const double T_step = 0.05; // 采样步长
+            const double T_step = 0.05;
             const double t_start = 0.0;
             const double t_end = traj.getTotalDuration();
             Eigen::Vector3d lastX = traj.evaluate(t_start, 0); 
 
-            for (double t = t_start + T_step; t < t_end; t += T_step)
-            {
+            for (double t = t_start + T_step; t < t_end; t += T_step) {
                 geometry_msgs::Point point;
                 Eigen::Vector3d X = traj.evaluate(t, 0);
-
                 point.x = lastX(0); point.y = lastX(1); point.z = lastX(2);
                 trajMarker.points.push_back(point);
-
                 point.x = X(0); point.y = X(1); point.z = X(2);
                 trajMarker.points.push_back(point);
-
                 lastX = X;
             }
             trajectoryPub.publish(trajMarker);
@@ -406,39 +386,36 @@ public:
     }
 
     // Visualize all spheres with centers sphs and the same radius
+    // 增加命名空间和颜色参数
     inline void visualizeSphere(const Eigen::Vector3d &center,
-                                const double &radius)
+                                const double &radius,
+                                const std::string &ns,
+                                double r, double g, double b)
     {
-        visualization_msgs::Marker sphereMarkers, sphereDeleter;
+        visualization_msgs::Marker sphereMarkers;
 
-        sphereMarkers.id = 0;
+        sphereMarkers.id = 0; // 同一个 ns 下保持 ID 为 0，会自动覆盖上一帧，实现动画效果
         sphereMarkers.type = visualization_msgs::Marker::SPHERE_LIST;
         sphereMarkers.header.stamp = ros::Time::now();
         sphereMarkers.header.frame_id = "odom";
         sphereMarkers.pose.orientation.w = 1.00;
         sphereMarkers.action = visualization_msgs::Marker::ADD;
-        sphereMarkers.ns = "spheres";
-        sphereMarkers.color.r = 0.00;
-        sphereMarkers.color.g = 0.00;
-        sphereMarkers.color.b = 1.00;
-        sphereMarkers.color.a = 1.00;
+        sphereMarkers.ns = ns; // 隔离不同轨迹的球
+        sphereMarkers.color.r = r;
+        sphereMarkers.color.g = g;
+        sphereMarkers.color.b = b;
+        sphereMarkers.color.a = 0.80; // 设置为 80% 透明度，防止多个球重叠时看不见
         sphereMarkers.scale.x = radius * 2.0;
         sphereMarkers.scale.y = radius * 2.0;
         sphereMarkers.scale.z = radius * 2.0;
 
-        sphereDeleter = sphereMarkers;
-        sphereDeleter.action = visualization_msgs::Marker::DELETE;
-
         geometry_msgs::Point point;
-        point.x = center(0);
-        point.y = center(1);
-        point.z = center(2);
+        point.x = center(0); point.y = center(1); point.z = center(2);
         sphereMarkers.points.push_back(point);
 
-        spherePub.publish(sphereDeleter);
         spherePub.publish(sphereMarkers);
     }
-
+    
     inline void visualizeStartGoal(const Eigen::Vector3d &center,
                                    const double &radius,
                                    const int sg)

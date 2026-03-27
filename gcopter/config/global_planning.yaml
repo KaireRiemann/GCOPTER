@@ -32,7 +32,7 @@ ParasDrag:                  0.01
 
 SpeedEps:                   0.0001
 
-WeightT:                    20.0
+WeightT:                    200.0
 
 ChiVec:                     [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5]
 

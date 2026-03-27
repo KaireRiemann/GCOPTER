@@ -104,6 +104,9 @@ private:
     int order;
     int N_c;
     
+    // --- 核心修复：显式保存时间向量 ---
+    Eigen::VectorXd durations_; 
+    
     Eigen::VectorXd knots;
     Eigen::Matrix<double, Eigen::Dynamic, Dim> control_points;
     Eigen::Matrix<double, Eigen::Dynamic, Dim> B_matrix_rhs; 
@@ -155,14 +158,13 @@ public:
     inline int getS() const { return s; }
     inline int getP() const { return p; }
     inline int getCtrlPtNum(int M) const { return M + 2 * s - 1; }
-    inline double getTotalDuration() const { return knots(knots.size() - 1); }
+
+    const Eigen::VectorXd& getDurations() const { return durations_; }
+    inline double getTotalDuration() const { return durations_.sum(); }
+    inline int getPieceNum() const { return durations_.size(); }
+    
     const Eigen::VectorXd& getKnots() const { return knots; }
     const Eigen::Matrix<double, Eigen::Dynamic, Dim>& getControlPoints() const { return control_points; }
-    inline int getPieceNum() const 
-    {
-        if (knots.size() == 0) return 0;
-        return knots.size() - 2 * p - 1;
-    }
 
     inline int findSpan(double t, int num_ctrl_pts, const Eigen::VectorXd& u) const {
         if (t >= u(num_ctrl_pts)) return num_ctrl_pts - 1;
@@ -255,6 +257,9 @@ public:
     {
         int M = T.size();
         N_c = getCtrlPtNum(M);
+  
+        durations_ = T; 
+
         P_full.resize(N_c, Dim);
         knots = generateKnots(T, N_c);
         
@@ -283,8 +288,8 @@ public:
 
     Eigen::Matrix<double, Dim, 1> evaluate(double t, int d_ord = 0) const 
     {
-        if (t <= knots(p)) t = knots(p);
-        if (t >= knots(knots.size() - p - 1)) t = knots(knots.size() - p - 1) - 1e-9;
+        if (t <= 0.0) t = 0.0;
+        if (t >= getTotalDuration()) t = getTotalDuration() - 1e-9;
         
         int span = findSpan(t, N_c, knots);
         Eigen::Matrix<double, MaxP+1, MaxP+1> ders;

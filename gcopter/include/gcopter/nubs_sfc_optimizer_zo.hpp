@@ -1,30 +1,35 @@
-#ifndef NUBS_SFC_OPTIMIZER_HPP
-#define NUBS_SFC_OPTIMIZER_HPP
+#ifndef NUBS_SFC_OPTIMIZER_ZO_HPP
+#define NUBS_SFC_OPTIMIZER_ZO_HPP
 
-#include "NUBSTrajectory/NUBSOptimizer.hpp" 
+#include "NUBSTrajectory/NUBSOptimizerZO.hpp" 
 #include "TrajectoryOptComponents/LinearTimeCost.hpp"
-#include "TrajectoryOptComponents/SFCCommonTypes.hpp"
 #include "TrajectoryOptComponents/SFCControlPointsCosts.hpp"
-#include "TrajectoryOptComponents/IdentitySpatialMap.hpp"
+#include "TrajectoryOptComponents/PolytopeSpatialMap.hpp" 
+#include "TrajectoryOptComponents/SFCControlPointsCostsZO.hpp"
+
+
+#include <libcmaes/cmaes.h>
+
 #include "gcopter/geo_utils.hpp"
-#include "gcopter/lbfgs.hpp"
+#include "gcopter/lbfgs.hpp" 
+#include "gcopter/abc_solver.hpp"
 
 #include <Eigen/Eigen>
-
 #include <cmath>
 #include <cstdlib>
 #include <cfloat>
 #include <vector>
+#include <iostream>
 
 namespace gcopter
 {
-    class NUBSSFCOptimizer
+    class NUBSSFCOptimizerZO
     {
     public:
         using TrajType = nubs::NUBSTrajectory<3, 7>;
-        using OptimizerType = nubs::NUBSOptimizer<3, 7,
-                                                  nubs::QuadInvTimeMap,
-                                                  gcopter::PolytopeSpatialMap>;
+        using OptimizerType = nubs::NUBSZeroOrderOptimizer<3, 7,
+                                                              nubs::QuadInvTimeMapZO,
+                                                              gcopter::PolytopeSpatialMapZO>;
 
         typedef Eigen::Matrix3Xd PolyhedronV;
         typedef Eigen::MatrixX4d PolyhedronH;
@@ -33,9 +38,9 @@ namespace gcopter
 
     private:
         OptimizerType optimizer_;
-        gcopter::PolytopeSpatialMap spatial_map_;
-        NUBSTimeCost time_cost_;
-        SFCControlPointCost cp_cost_;
+        gcopter::PolytopeSpatialMapZO spatial_map_;
+        NUBSTimeCostZO time_cost_;
+        SFCControlPointCostZO cp_cost_;
 
         Eigen::Matrix3d headState_; // [Pos, Vel, Acc]
         Eigen::Matrix3d tailState_; // [Pos, Vel, Acc]
@@ -51,18 +56,15 @@ namespace gcopter
         int polyN_ = 0;
         int pieceN_ = 0;
 
-        double smoothEps_ = 0.0;
         Eigen::VectorXd magnitudeBd_;
         Eigen::VectorXd penaltyWt_;
         double allocSpeed_ = 0.0;
-
-        lbfgs::lbfgs_parameter_t lbfgs_params_{};
 
         std::vector<double> ref_times_;
         Eigen::MatrixXd ref_waypoints_;
 
     private:
-        static inline double costDistance(void *ptr,
+    static inline double costDistance(void *ptr,
                                           const Eigen::VectorXd &xi,
                                           Eigen::VectorXd &gradXi)
         {
@@ -170,7 +172,7 @@ namespace gcopter
 
             lbfgs::lbfgs_optimize(xi,
                                   minDistance,
-                                  &NUBSSFCOptimizer::costDistance,
+                                  &NUBSSFCOptimizerZO::costDistance,
                                   nullptr,
                                   nullptr,
                                   dataPtrs,
@@ -272,39 +274,18 @@ namespace gcopter
             }
         }
 
-        /**
-         * @brief L-BFGS 调用的静态目标函数回调
-         */
-        static inline double costFunctional(void *ptr,
-                                            const Eigen::VectorXd &x,
-                                            Eigen::VectorXd &g)
-        {
-            auto &obj = *(NUBSSFCOptimizer *)ptr;
-            // 核心调用：将 x 映射、求轨、算物理代价、反传梯
-            double cost = obj.optimizer_.evaluate(x, g, obj.time_cost_, obj.cp_cost_);
-
-            if (!std::isfinite(cost) || !g.allFinite())
-            {
-                g.setZero();
-                return 1.0e20;
-            }
-            
-            return cost;
-        }
 
     public:
         /**
-         * @brief 初始化环境、提取初值、配置优化器参数
+         * @brief 初始化环境、提取初值、配置优化器参数 
          */
         bool setup(const double &timeWeight,
                    const Eigen::Matrix3d &initialPVA,
                    const Eigen::Matrix3d &terminalPVA,
                    const PolyhedraH &safeCorridor,
                    const double &lengthPerPiece,
-                   const double &smoothingFactor,
                    const Eigen::VectorXd &magnitudeBounds,
-                   const Eigen::VectorXd &penaltyWeights,
-                   const Eigen::VectorXd &physicalParams) 
+                   const Eigen::VectorXd &penaltyWeights) 
         {
             headState_ = initialPVA;
             tailState_ = terminalPVA;
@@ -318,13 +299,11 @@ namespace gcopter
             if (!processCorridor(hPolytopes_, vPolytopes_)) return false;
 
             polyN_ = hPolytopes_.size();
-            smoothEps_ = smoothingFactor;
             magnitudeBd_ = magnitudeBounds; // [max_vel, max_thrust, ...]
             penaltyWt_ = penaltyWeights;    // [wt_vel, wt_thrust, ...]
-            allocSpeed_ = magnitudeBd_(0) * 3.0; 
+            allocSpeed_ = magnitudeBd_(0) * 0.3; 
 
-    
-            getShortestPath(headState_.col(0), tailState_.col(0), vPolytopes_, smoothEps_, shortPath_);
+            getShortestPath(headState_.col(0), tailState_.col(0), vPolytopes_, 0.1, shortPath_);
             
             const Eigen::Matrix3Xd deltas = shortPath_.rightCols(polyN_) - shortPath_.leftCols(polyN_);
             pieceIdx_ = (deltas.colwise().norm() / lengthPerPiece).cast<int>().transpose();
@@ -357,24 +336,21 @@ namespace gcopter
             }
             waypoints.row(pieceN_) = tailState_.col(0).transpose();
 
-            // 注入到优化器中
+            // 注入到零阶优化器中
             if (!optimizer_.setInitState(std::vector<double>(timeAlloc.data(), timeAlloc.data() + timeAlloc.size()),
-                                         waypoints,
-                                         headState_,
-                                         tailState_))
+                                         waypoints, headState_, tailState_))
             {
                 return false;
             }
 
+            // 初始化零阶代价组件
             time_cost_.weight = timeWeight;
             const double overshoot_protection = 4.5;
-            
             cp_cost_.max_v = magnitudeBd_(0) * overshoot_protection;
             cp_cost_.max_thrust = magnitudeBd_(1) * overshoot_protection ;
             cp_cost_.weight_v = penaltyWt_(0);
             cp_cost_.weight_thrust = penaltyWt_(1);
             cp_cost_.weight_pos = penaltyWt_.size() > 2 ? penaltyWt_(2) : 10000.0; 
-            cp_cost_.smooth_eps = smoothEps_;
             cp_cost_.hPolys = &hPolytopes_;
             
             int p = optimizer_.getTrajectory().getP();
@@ -384,9 +360,7 @@ namespace gcopter
             for (int j = 0; j < nc; ++j) 
             {
                 int primary_piece = j - p / 2;
-                
                 primary_piece = std::max(0, std::min(pieceN_ - 1, primary_piece));
-                
                 mapping[j].push_back(hPolyIdx_(primary_piece));
             }
             cp_cost_.cp_to_polys = mapping;
@@ -395,109 +369,84 @@ namespace gcopter
         }
 
         /**
-         * @brief 执行主优化逻辑
+         * @brief 执行主优化逻辑 
          */
-        double optimize(TrajType &spline, const double &relCostTol)
+        double optimize(TrajType &spline)
         {
-            Eigen::VectorXd x = optimizer_.generateInitialGuess();
+            Eigen::VectorXd x0 = optimizer_.generateInitialGuess();
+            int dim = x0.size();
 
-            double minCostFunctional = 0.0;
-            lbfgs_params_.mem_size = 256;
-            lbfgs_params_.past = 3;
-            lbfgs_params_.min_step = 1.0e-32;
-            lbfgs_params_.g_epsilon = 0.0;
-            lbfgs_params_.delta = relCostTol;
+            // auto initial_breakdown = optimizer_.debugEvaluate(x0, time_cost_, cp_cost_);
+            // initial_breakdown.print("INITIAL");
+            // // 进一步透视物理代价
+            // cp_cost_.debugPrint(optimizer_.getTrajectory().getControlPoints(),
+            //                     Eigen::MatrixXd::Zero(0,3), Eigen::MatrixXd::Zero(0,3), Eigen::MatrixXd::Zero(0,3)); 
+            // ===============================================
 
-            const char *grad_check_env = std::getenv("GCOPTER_GRAD_CHECK");
-            if (grad_check_env && std::string(grad_check_env) == "1")
+            Eigen::VectorXd lb = x0.array() - 0.5;
+            Eigen::VectorXd ub = x0.array() + 0.5;
+            for (int i = 0; i < pieceN_; ++i) 
             {
-                struct ZeroTimeCost {
-                    double operator()(const std::vector<double> &/*Ts*/, Eigen::VectorXd &grad) const {
-                        grad.setZero();
-                        return 0.0;
-                    }
-                };
-
-                auto zero_cp = [](const Eigen::MatrixXd &/*C*/,const Eigen::MatrixXd &/*V*/, const Eigen::MatrixXd &/*A*/, const Eigen::MatrixXd &/*J*/,
-                                  double &cost, Eigen::MatrixXd &/*gdC*/, Eigen::MatrixXd &/*gdV*/, Eigen::MatrixXd &/*gdA*/, Eigen::MatrixXd &/*gdJ*/)
-                {
-                    cost = 0.0;
-                };
-
-                auto run_check = [&](const char *tag,
-                                     auto &&time_func,
-                                     auto &&cp_func,
-                                     double energy_weight)
-                {
-                    optimizer_.setEnergyWeights(energy_weight);
-                    auto check = optimizer_.checkGradients(
-                        x,
-                        std::forward<decltype(time_func)>(time_func),
-                        std::forward<decltype(cp_func)>(cp_func));
-                        
-                    std::cerr << "[GradCheck] " << tag << " -> " << check.makeReport();
-                    std::cerr << "[GradCheck] " << tag << " rel error: " << check.rel_error
-                              << " | norm: " << check.error_norm << std::endl;
-                              
-                    if (check.analytical.size() == check.numerical.size() && check.analytical.size() > 0)
-                    {
-                        const int time_dim = pieceN_;
-                        const int total_dim = static_cast<int>(check.analytical.size());
-                        const int spatial_dim = std::max(0, total_dim - time_dim);
-
-                        if (time_dim > 0 && total_dim >= time_dim) {
-                            Eigen::VectorXd diff = check.analytical - check.numerical;
-                            double time_err = diff.head(time_dim).norm();
-                            double time_norm = check.analytical.head(time_dim).norm();
-                            double time_rel = (time_norm > 1e-9) ? (time_err / time_norm) : time_err;
-                            std::cerr << "[GradCheck] " << tag << " time rel: " << time_rel << " | time norm: " << time_err << std::endl;
-                        }
-
-                        if (spatial_dim > 0) {
-                            Eigen::VectorXd diff = check.analytical - check.numerical;
-                            double spatial_err = diff.tail(spatial_dim).norm();
-                            double spatial_norm = check.analytical.tail(spatial_dim).norm();
-                            double spatial_rel = (spatial_norm > 1e-9) ? (spatial_err / spatial_norm) : spatial_err;
-                            std::cerr << "[GradCheck] " << tag << " spatial rel: " << spatial_rel << " | spatial norm: " << spatial_err << std::endl;
-                        }
-                    }
-                    std::cerr.flush();
-                };
-
-                run_check("ALL (time+cp+energy)", time_cost_, cp_cost_, 1.0);
-                run_check("TIME ONLY", time_cost_, zero_cp, 0.0);
-                run_check("CP ONLY (Penalty)", ZeroTimeCost(), cp_cost_, 0.0);
-                run_check("ENERGY ONLY (Min-Jerk)", ZeroTimeCost(), zero_cp, 1.0);
-
-                optimizer_.setEnergyWeights(1.0);
+                lb(i) = std::max(lb(i), 0.1); 
             }
 
-            const int ret = lbfgs::lbfgs_optimize(x,
-                                                  minCostFunctional,
-                                                  &NUBSSFCOptimizer::costFunctional,
-                                                  nullptr,
-                                                  nullptr,
-                                                  this,
-                                                  lbfgs_params_);
 
-            if (ret >= 0)
+            auto objFunc = [this](const Eigen::RowVectorXd &x_row) -> std::pair<double, bool> 
             {
-                Eigen::VectorXd grad(x.size());
-                // 确保在最优参数处，提取一次最终轨迹
-                minCostFunctional = optimizer_.evaluate(x, grad, time_cost_, cp_cost_);
-                spline = optimizer_.getTrajectory();
-            }
-            else
-            {
-                spline = TrajType();
-                minCostFunctional = INFINITY;
-                std::cout << "NUBS Optimization Failed: " << lbfgs::lbfgs_strerror(ret) << std::endl;
-            }
+                Eigen::VectorXd x = x_row.transpose();
+                double cost = optimizer_.evaluate(x, time_cost_, cp_cost_);
+                bool is_valid = std::isfinite(cost) && (cost < 10000.0);
+                return {std::isfinite(cost) ? cost : 1.0e10, is_valid};
+            };
 
-            return minCostFunctional;
+            ABC abc;
+            int nPop = 20;   
+            int MaxIt = 50;   
+            
+     
+            int priority_count = nPop / 3;
+            double variation_radius = 0.1; 
+            abc.initializeWithPriority(nPop, MaxIt, ub, lb, dim, 
+                                       priority_count, variation_radius, x0.transpose());
+
+            // 5. 执行 ABC 寻优
+            auto [bestCost, bestPos] = abc.optimize(nPop, MaxIt, ub, lb, dim, objFunc);
+
+            // 6. 提取最优解并覆盖更新内部状态
+            Eigen::VectorXd best_x = bestPos.transpose();
+            double final_cost = optimizer_.evaluate(best_x, time_cost_, cp_cost_);
+            spline = optimizer_.getTrajectory();
+
+            std::cout << "ABC Optimization Finished." 
+                      << " Final Cost: " << final_cost 
+                      << std::endl;
+            
+            // std::cout << "\n>>> Analyzing Final Optimized Solution <<<";
+            // auto final_breakdown = optimizer_.debugEvaluate(best_x, time_cost_, cp_cost_);
+            // final_breakdown.print("FINAL");
+            
+            // // 我们手动用零阶评估器提取最佳轨迹的 V 和 A 用于透视
+            // const auto& C = spline.getControlPoints();
+            // const auto& u = spline.getKnots();
+            // int p = spline.getP();
+            // int n = C.rows();
+            // Eigen::MatrixXd V(std::max(0, n - 1), 3);
+            // Eigen::MatrixXd A(std::max(0, n - 2), 3);
+            // for (int i = 0; i < n - 1; ++i) {
+            //     double dt = u(i + p + 1) - u(i + 1);
+            //     if(dt>1e-9) V.row(i) = (p / dt) * (C.row(i + 1) - C.row(i)); else V.row(i).setZero();
+            // }
+            // for (int i = 0; i < n - 2; ++i) {
+            //     double dt = u(i + p + 1) - u(i + 2);
+            //     if(dt>1e-9) A.row(i) = ((p - 1) / dt) * (V.row(i + 1) - V.row(i)); else A.row(i).setZero();
+            // }
+            
+            // cp_cost_.debugPrint(C, V, A, Eigen::MatrixXd::Zero(0,3));          
+
+            return final_cost;
         }
     };
 
-} // namespace gcopter
+} // namespace gcopter_zo
 
-#endif // NUBS_SFC_OPTIMIZER_HPP
+#endif // NUBS_SFC_OPTIMIZER_ZO_HPP

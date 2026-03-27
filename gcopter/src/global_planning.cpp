@@ -8,6 +8,7 @@
 #include "SplineTrajectory/SplineTrajectory.hpp"
 #include "NUBSTrajectory/NUBSTrajectory.hpp"
 #include "gcopter/nubs_sfc_optimizer.hpp"
+#include "gcopter/nubs_sfc_optimizer_zo.hpp"
 
 #include <ros/ros.h>
 #include <ros/console.h>
@@ -92,6 +93,7 @@ private:
 
     SplineTrajectory::QuinticSpline3D spline_traj;
     nubs::NUBSTrajectory<3> nubs_traj;
+    nubs::NUBSTrajectory<3> nubs_traj_zo;
     Trajectory<5> traj;
     double trajStamp;
 
@@ -183,6 +185,8 @@ public:
                 gcopter::GCOPTER_PolytopeSFC minco_opt;
                 gcopter::SplineSFCOptimizer spline_opt;
                 gcopter::NUBSSFCOptimizer nubs_opt;
+                gcopter::NUBSSFCOptimizerZO nubs_opt_zo;
+                
 
                 // magnitudeBounds = [v_max, omg_max, theta_max, thrust_min, thrust_max]^T
                 // penaltyWeights = [pos_weight, vel_weight, omg_weight, theta_weight, thrust_weight]^T
@@ -234,11 +238,6 @@ public:
                 double t_m = std::chrono::duration_cast<std::chrono::milliseconds>(t_m2-t_m1).count();
                 std::cout<<"minco trajectory optimize time : "<<t_m<<" ms"<<std::endl;
 
-                if (traj.getPieceNum() > 0)
-                {
-                    trajStamp = ros::Time::now().toSec();
-                    visualizer.visualize(traj, route);
-                }
 
                 auto t1 = std::chrono::high_resolution_clock::now();
                 if (!spline_opt.setup(config.weightT,
@@ -285,18 +284,61 @@ public:
                 double t_b = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
                 std::cout<<"nubs trajectory optimize time : "<<t_b<<" ms"<<std::endl;
 
+
+                auto t7 = std::chrono::high_resolution_clock::now();
+                if(!nubs_opt_zo.setup(config.weightT,iniState,finState,hPolys,INFINITY,
+                                      magnitudeBounds,penaltyWeights))
+                {
+                    ROS_WARN("NUBS ZERO-ORDER Optimizer Setup Failed!");
+                    return;
+                }
+
+
+                if (std::isinf(nubs_opt_zo.optimize(nubs_traj_zo)))
+                {
+                    ROS_WARN("NUBS ZERO-ORDER Optimization Diverged/Failed!");
+                    return;
+                }
+                auto t8 = std::chrono::high_resolution_clock::now();
+                double t_o = std::chrono::duration_cast<std::chrono::milliseconds>(t8-t7).count();
+                std::cout<<"zeor-order nubs trajectory optimize time : "<<t_o<<" ms"<<std::endl;
+
+                trajStamp = ros::Time::now().toSec();
+                if (traj.getPieceNum() > 0)
+                {
+                    visualizer.visualize(traj, route);
+                }
+
                 if (spline_traj.isInitialized() && spline_traj.getNumSegments() > 0)
                 {
-                    trajStamp = ros::Time::now().toSec();
+                    
                     visualizer.visualize(spline_traj, route);
+                }
+
+                if(nubs_traj_zo.getPieceNum() > 0)
+                {
+                    visualizer.visualize(nubs_traj_zo, route, "zo", 1.0, 0.0, 1.0);
                 }
 
                 if(nubs_traj.getPieceNum() > 0)
                 {
-                    trajStamp = ros::Time::now().toSec();
-                    visualizer.visualize(nubs_traj,route);
+                    visualizer.visualize(nubs_traj, route, "lbfgs", 0.0, 1.0, 0.0);
                 }
+
+                
             }
+
+
+        double time_minco = traj.getTotalDuration();
+        double time_spline = spline_traj.getDuration();
+        double time_nubs_gd = nubs_traj.getTotalDuration();
+        double time_nubs_zo = nubs_traj_zo.getTotalDuration();
+
+        std::cout<< " Trajectory Time : "<<std::endl;
+        std::cout<< " MINCO Time : "<<time_minco<<" s"<<std::endl;
+        std::cout<< " Spline Time : "<<time_spline<<" s"<<std::endl;
+        std::cout<< " NUBS Time : "<<time_nubs_gd<<" s"<<std::endl;
+        std::cout<< " NUBS ZO Time : "<<time_nubs_zo<<" s"<<std::endl;
             
         }
     }
@@ -331,53 +373,55 @@ public:
     inline void process()
     {
         Eigen::VectorXd physicalParams(6);
-        physicalParams(0) = config.vehicleMass;
-        physicalParams(1) = config.gravAcc;
-        physicalParams(2) = config.horizDrag;
-        physicalParams(3) = config.vertDrag;
-        physicalParams(4) = config.parasDrag;
-        physicalParams(5) = config.speedEps;
-
+        physicalParams << config.vehicleMass, config.gravAcc, config.horizDrag, 
+                          config.vertDrag, config.parasDrag, config.speedEps;
         flatness::FlatnessMap flatmap;
         flatmap.reset(physicalParams(0), physicalParams(1), physicalParams(2),
                       physicalParams(3), physicalParams(4), physicalParams(5));
 
-        if (spline_traj.isInitialized() && spline_traj.getNumSegments() > 0)
+        const double delta = ros::Time::now().toSec() - trajStamp;
+        if (delta <= 0.0) return;
+
+        if (spline_traj.isInitialized() && spline_traj.getNumSegments() > 0 && delta < spline_traj.getDuration())
         {
-            const double delta = ros::Time::now().toSec() - trajStamp;
-            if (delta > 0.0 && delta < spline_traj.getDuration())
-            {
-                double thr;
-                Eigen::Vector4d quat;
-                Eigen::Vector3d omg;
+            double thr; Eigen::Vector4d quat; Eigen::Vector3d omg;
+            const auto &ppoly = spline_traj.getTrajectory();
+            const Eigen::Vector3d vel = ppoly.evaluate(delta, SplineTrajectory::Deriv::Vel);
+            const Eigen::Vector3d acc = ppoly.evaluate(delta, SplineTrajectory::Deriv::Acc);
+            const Eigen::Vector3d jer = ppoly.evaluate(delta, SplineTrajectory::Deriv::Jerk);
+            const Eigen::Vector3d pos = ppoly.evaluate(delta, SplineTrajectory::Deriv::Pos);
 
-                const auto &ppoly = spline_traj.getTrajectory();
-                const Eigen::Vector3d vel = ppoly.evaluate(delta, SplineTrajectory::Deriv::Vel);
-                const Eigen::Vector3d acc = ppoly.evaluate(delta, SplineTrajectory::Deriv::Acc);
-                const Eigen::Vector3d jer = ppoly.evaluate(delta, SplineTrajectory::Deriv::Jerk);
-                const Eigen::Vector3d pos = ppoly.evaluate(delta, SplineTrajectory::Deriv::Pos);
+            flatmap.forward(vel, acc, jer, 0.0, 0.0, thr, quat, omg);
+            
+            std_msgs::Float64 speedMsg, thrMsg, tiltMsg, bdrMsg;
+            speedMsg.data = vel.norm();
+            thrMsg.data = thr;
+            tiltMsg.data = acos(1.0 - 2.0 * (quat(1)*quat(1) + quat(2)*quat(2)));
+            bdrMsg.data = omg.norm();
+            visualizer.speedPub.publish(speedMsg);
+            visualizer.thrPub.publish(thrMsg);
+            visualizer.tiltPub.publish(tiltMsg);
+            visualizer.bdrPub.publish(bdrMsg);
 
-                flatmap.forward(vel,
-                                acc,
-                                jer,
-                                0.0, 0.0,
-                                thr, quat, omg);
-                double speed = vel.norm();
-                double bodyratemag = omg.norm();
-                double tiltangle = acos(1.0 - 2.0 * (quat(1) * quat(1) + quat(2) * quat(2)));
-                std_msgs::Float64 speedMsg, thrMsg, tiltMsg, bdrMsg;
-                speedMsg.data = speed;
-                thrMsg.data = thr;
-                tiltMsg.data = tiltangle;
-                bdrMsg.data = bodyratemag;
-                visualizer.speedPub.publish(speedMsg);
-                visualizer.thrPub.publish(thrMsg);
-                visualizer.tiltPub.publish(tiltMsg);
-                visualizer.bdrPub.publish(bdrMsg);
+            visualizer.visualizeSphere(pos, config.dilateRadius, "spline_sphere", 0.0, 0.5, 1.0);
+        }
 
-                visualizer.visualizeSphere(pos,
-                                           config.dilateRadius);
-            }
+        // 2. 处理 MINCO 轨迹运动小球 (深蓝色)
+        if (traj.getPieceNum() > 0 && delta < traj.getTotalDuration()) {
+            Eigen::Vector3d pos = traj.getPos(delta);
+            visualizer.visualizeSphere(pos, config.dilateRadius, "minco_sphere", 0.0, 0.0, 1.0);
+        }
+
+        // 3. 处理 NUBS 一阶轨迹运动小球 (绿色)
+        if (nubs_traj.getKnots().size() > 0 && delta < nubs_traj.getTotalDuration()) {
+            Eigen::Vector3d pos = nubs_traj.evaluate(delta, 0);
+            visualizer.visualizeSphere(pos, config.dilateRadius, "nubs_lbfgs_sphere", 0.0, 1.0, 0.0);
+        }
+
+        // 4. 处理 NUBS 零阶轨迹运动小球 (紫色)
+        if (nubs_traj_zo.getKnots().size() > 0 && delta < nubs_traj_zo.getTotalDuration()) {
+            Eigen::Vector3d pos = nubs_traj_zo.evaluate(delta, 0);
+            visualizer.visualizeSphere(pos, config.dilateRadius, "nubs_zo_sphere", 1.0, 0.0, 1.0);
         }
     }
 };
