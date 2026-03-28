@@ -30,3 +30,13 @@
 *.exe
 *.out
 *.app
+
+# Generated plots and local tooling artifacts
+gcopter/scripts/result/
+gcopter/scripts/*.csv
+
+# Local editor / machine-specific config
+.vscode/
+.idea/
+*.code-workspace
+*.rviz

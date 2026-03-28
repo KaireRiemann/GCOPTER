@@ -10,7 +10,6 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -fPIC")
 
 find_package(Eigen3 REQUIRED)
 find_package(ompl REQUIRED)
-find_package(libcmaes REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -30,9 +29,14 @@ include_directories(
 catkin_package()
 
 add_executable(global_planning src/global_planning.cpp)
+add_executable(test_planning src/test_planning.cpp)
 
 target_link_libraries(global_planning
   ${OMPL_LIBRARIES}
   ${catkin_LIBRARIES}
-  libcmaes::cmaes
+)
+
+target_link_libraries(test_planning
+  ${OMPL_LIBRARIES}
+  ${catkin_LIBRARIES}
 )
