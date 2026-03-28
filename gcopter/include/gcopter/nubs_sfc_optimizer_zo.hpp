@@ -5,13 +5,16 @@
 #include "TrajectoryOptComponents/LinearTimeCost.hpp"
 #include "TrajectoryOptComponents/SFCControlPointsCostsZO.hpp"
 #include "TrajectoryOptComponents/PolytopeSpatialMapZO.hpp"
-#include "gcopter/abc_solver.hpp" 
+#include "gcopter/abc_solver.hpp"
+#include "gcopter/dpasa_solver.hpp"
 #include "gcopter/geo_utils.hpp"
 #include "gcopter/lbfgs.hpp" 
 
 #include <Eigen/Eigen>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 #include <iostream>
 
@@ -20,6 +23,12 @@ namespace gcopter
     class NUBSSFCOptimizerZO
     {
     public:
+        enum class SolverBackend
+        {
+            ABC,
+            DPASA
+        };
+
         using TrajType = nubs::NUBSTrajectory<3, 7>;
         using OptimizerType = nubs::NUBSZeroOrderOptimizer<3, 7, nubs::QuadInvTimeMapZO, gcopter::PolytopeSpatialMapZO>;
         typedef Eigen::Matrix3Xd PolyhedronV;
@@ -40,8 +49,34 @@ namespace gcopter
         int polyN_ = 0, pieceN_ = 0;
         Eigen::VectorXd magnitudeBd_, penaltyWt_;
         double allocSpeed_ = 0.0;
+        SolverBackend backend_ = SolverBackend::DPASA;
+
+    public:
+        explicit NUBSSFCOptimizerZO(SolverBackend backend = SolverBackend::DPASA)
+            : backend_(backend)
+        {
+        }
+
+        void setSolverBackend(SolverBackend backend)
+        {
+            backend_ = backend;
+        }
 
     private:
+        struct ObjectiveSummary
+        {
+            double total_cost = std::numeric_limits<double>::infinity();
+            double base_cost = std::numeric_limits<double>::infinity();
+            double sampled_corridor_cost = 0.0;
+            double sampled_speed_cost = 0.0;
+            double sampled_thrust_cost = 0.0;
+            double max_corridor_violation = 0.0;
+            double max_speed_violation = 0.0;
+            double max_thrust_violation = 0.0;
+            bool finite = false;
+            bool feasible = false;
+        };
+
         static inline double costDistance(void *ptr,
                                           const Eigen::VectorXd &xi,
                                           Eigen::VectorXd &gradXi)
@@ -252,6 +287,324 @@ namespace gcopter
             }
         }
 
+        static inline double positiveToPhysicalTime(const double tau)
+        {
+            return nubs::QuadInvTimeMapZO().toTime(tau);
+        }
+
+        static inline double physicalTimeToPositive(const double time)
+        {
+            return nubs::QuadInvTimeMapZO().toTau(std::max(time, 1.0e-8));
+        }
+
+        static inline Eigen::VectorXd scaleProfileToPhysicalTimes(const Eigen::VectorXd &encoded)
+        {
+            const int num_segments = encoded.size();
+            Eigen::VectorXd times(num_segments);
+            if (num_segments <= 0)
+            {
+                return times;
+            }
+
+            const double total_time = positiveToPhysicalTime(encoded(0));
+            if (num_segments == 1)
+            {
+                times(0) = total_time;
+                return times;
+            }
+
+            Eigen::VectorXd logits(num_segments);
+            logits.head(num_segments - 1) = encoded.tail(num_segments - 1);
+            logits(num_segments - 1) = 0.0;
+
+            const double max_logit = logits.maxCoeff();
+            Eigen::VectorXd exp_logits = (logits.array() - max_logit).exp();
+            const double exp_sum = std::max(exp_logits.sum(), 1.0e-8);
+            const Eigen::VectorXd alpha = exp_logits / exp_sum;
+            times = total_time * alpha;
+            return times;
+        }
+
+        static inline Eigen::VectorXd physicalTimesToScaleProfile(const Eigen::VectorXd &times)
+        {
+            const int num_segments = times.size();
+            Eigen::VectorXd encoded = Eigen::VectorXd::Zero(num_segments);
+            if (num_segments <= 0)
+            {
+                return encoded;
+            }
+
+            const double total_time = std::max(times.sum(), 1.0e-8);
+            encoded(0) = physicalTimeToPositive(total_time);
+
+            if (num_segments == 1)
+            {
+                return encoded;
+            }
+
+            Eigen::VectorXd alpha(num_segments);
+            for (int i = 0; i < num_segments; ++i)
+            {
+                alpha(i) = std::max(times(i) / total_time, 1.0e-8);
+            }
+            alpha /= alpha.sum();
+
+            const double anchor = std::log(alpha(num_segments - 1));
+            for (int i = 0; i < num_segments - 1; ++i)
+            {
+                encoded(1 + i) = std::log(alpha(i)) - anchor;
+            }
+            return encoded;
+        }
+
+        Eigen::RowVectorXd evaluatorToDecision(const Eigen::VectorXd &x_eval) const
+        {
+            const int time_dim = pieceN_;
+            const int spatial_dim = x_eval.size() - time_dim;
+            Eigen::RowVectorXd theta(x_eval.size());
+
+            if (spatial_dim > 0)
+            {
+                theta.head(spatial_dim) = x_eval.tail(spatial_dim).transpose();
+            }
+
+            Eigen::VectorXd times(time_dim);
+            for (int i = 0; i < time_dim; ++i)
+            {
+                times(i) = positiveToPhysicalTime(x_eval(i));
+            }
+            theta.tail(time_dim) = physicalTimesToScaleProfile(times).transpose();
+            return theta;
+        }
+
+        Eigen::VectorXd decisionToEvaluator(const Eigen::RowVectorXd &theta) const
+        {
+            const int time_dim = pieceN_;
+            const int spatial_dim = theta.size() - time_dim;
+            Eigen::VectorXd x_eval(theta.size());
+
+            Eigen::VectorXd times = scaleProfileToPhysicalTimes(theta.tail(time_dim).transpose());
+            for (int i = 0; i < time_dim; ++i)
+            {
+                x_eval(i) = physicalTimeToPositive(times(i));
+            }
+            if (spatial_dim > 0)
+            {
+                x_eval.tail(spatial_dim) = theta.head(spatial_dim).transpose();
+            }
+            return x_eval;
+        }
+
+        double evaluateDecision(const Eigen::RowVectorXd &theta,
+                                const NUBSTimeCostZO &time_cost,
+                                const SFCControlPointCostZO &cp_cost)
+        {
+            return evaluateObjective(theta, time_cost, cp_cost).total_cost;
+        }
+
+        ObjectiveSummary evaluateObjective(const Eigen::RowVectorXd &theta,
+                                           const NUBSTimeCostZO &time_cost,
+                                           const SFCControlPointCostZO &cp_cost)
+        {
+            ObjectiveSummary summary;
+            const Eigen::VectorXd x_eval = decisionToEvaluator(theta);
+            summary.base_cost = optimizer_.evaluate(x_eval, time_cost, cp_cost);
+            summary.total_cost = summary.base_cost;
+            summary.finite = std::isfinite(summary.base_cost);
+            if (summary.finite)
+            {
+                const auto &traj = optimizer_.getTrajectory();
+                const auto &C = traj.getControlPoints();
+                const auto &u = traj.getKnots();
+                const int p = traj.getP();
+                const int n = static_cast<int>(C.rows());
+
+                Eigen::MatrixXd V(std::max(0, n - 1), 3);
+                Eigen::MatrixXd A(std::max(0, n - 2), 3);
+                for (int i = 0; i < n - 1; ++i)
+                {
+                    const double dt = u(i + p + 1) - u(i + 1);
+                    if (dt > 1.0e-9)
+                    {
+                        V.row(i) = (p / dt) * (C.row(i + 1) - C.row(i));
+                    }
+                    else
+                    {
+                        V.row(i).setZero();
+                    }
+                }
+                for (int i = 0; i < n - 2; ++i)
+                {
+                    const double dt = u(i + p + 1) - u(i + 2);
+                    if (dt > 1.0e-9)
+                    {
+                        A.row(i) = ((p - 1) / dt) * (V.row(i + 1) - V.row(i));
+                    }
+                    else
+                    {
+                        A.row(i).setZero();
+                    }
+                }
+
+                summary.max_corridor_violation = cp_cost.maxPieceHullViolation(C);
+                summary.max_speed_violation = cp_cost.maxSpeedViolation(V);
+                summary.max_thrust_violation = cp_cost.maxThrustViolation(A);
+            }
+            summary.feasible = summary.finite &&
+                               summary.max_corridor_violation <= 1.0e-6 &&
+                               summary.max_speed_violation <= 1.0e-6 &&
+                               summary.max_thrust_violation <= 1.0e-6;
+            if (!summary.finite)
+            {
+                summary.total_cost = 1.0e20;
+            }
+            return summary;
+        }
+
+        void buildDecisionBounds(const Eigen::RowVectorXd &theta0,
+                                 Eigen::VectorXd &lb,
+                                 Eigen::VectorXd &ub) const
+        {
+            const int dim = theta0.size();
+            const int time_dim = pieceN_;
+            const int spatial_dim = dim - time_dim;
+
+            lb.resize(dim);
+            ub.resize(dim);
+
+            for (int i = 0; i < spatial_dim; ++i)
+            {
+                lb(i) = theta0(i) - 1.0;
+                ub(i) = theta0(i) + 1.0;
+            }
+
+            const Eigen::VectorXd initial_times = scaleProfileToPhysicalTimes(theta0.tail(time_dim).transpose());
+            const double initial_total_time = std::max(initial_times.sum(), 1.0e-3);
+            lb(spatial_dim) = physicalTimeToPositive(initial_total_time * 0.85);
+            ub(spatial_dim) = physicalTimeToPositive(initial_total_time * 2.20);
+
+            for (int i = 0; i < time_dim - 1; ++i)
+            {
+                const int idx = spatial_dim + 1 + i;
+                lb(idx) = theta0(idx) - 2.5;
+                ub(idx) = theta0(idx) + 2.5;
+            }
+        }
+
+        double optimizeWithABC(const Eigen::RowVectorXd &theta0,
+                               const Eigen::VectorXd &lb,
+                               const Eigen::VectorXd &ub,
+                               TrajType &spline)
+        {
+            auto obj_func = [this](const Eigen::RowVectorXd &theta) -> std::pair<double, bool>
+            {
+                const ObjectiveSummary summary = evaluateObjective(theta, time_cost_, cp_cost_);
+                return {summary.total_cost, summary.feasible};
+            };
+
+            ABC abc;
+            const int dim = theta0.size();
+            const int n_pop = 24;
+            const int max_it = 36;
+            abc.initializeWithPriority(n_pop, max_it, ub, lb, dim,
+                                       n_pop / 2, 0.08, theta0);
+            const auto [best_cost_unused, best_theta] = abc.optimize(n_pop, max_it, ub, lb, dim, obj_func);
+            (void)best_cost_unused;
+
+            const double final_cost = evaluateObjective(best_theta, time_cost_, cp_cost_).total_cost;
+            spline = optimizer_.getTrajectory();
+            return final_cost;
+        }
+
+        double optimizeWithDPASA(const Eigen::RowVectorXd &theta0,
+                                 const Eigen::VectorXd &lb,
+                                 const Eigen::VectorXd &ub,
+                                 TrajType &spline)
+        {
+            const int dim = theta0.size();
+            const int time_dim = pieceN_;
+            const int spatial_dim = dim - time_dim;
+
+            gcopter::DPASABlockLayout layout;
+            layout.spatial = {0, spatial_dim};
+            layout.scale = {spatial_dim, 1};
+            layout.profile = {spatial_dim + 1, std::max(0, time_dim - 1)};
+
+            NUBSTimeCostZO feasibility_time_cost = time_cost_;
+            SFCControlPointCostZO feasibility_cp_cost = cp_cost_;
+            feasibility_time_cost.weight *= 0.80;
+            feasibility_cp_cost.weight_v *= 1.50;
+            feasibility_cp_cost.weight_thrust *= 1.50;
+            feasibility_cp_cost.weight_pos *= 1.25;
+
+            NUBSTimeCostZO refinement_time_cost = time_cost_;
+            SFCControlPointCostZO refinement_cp_cost = cp_cost_;
+            refinement_time_cost.weight *= 1.35;
+            refinement_cp_cost.weight_v *= 0.65;
+            refinement_cp_cost.weight_thrust *= 0.65;
+
+            auto makeObjective = [this](const NUBSTimeCostZO &time_cost,
+                                        const SFCControlPointCostZO &cp_cost)
+            {
+                return [this, time_cost, cp_cost](const Eigen::RowVectorXd &theta) -> std::pair<double, bool>
+                {
+                    const ObjectiveSummary summary = evaluateObjective(theta, time_cost, cp_cost);
+                    return {summary.total_cost, summary.feasible};
+                };
+            };
+
+            gcopter::DPASASolverOptions stage1_options;
+            stage1_options.n_candidates = 16;
+            stage1_options.n_strategies = 6;
+            stage1_options.max_iterations = 14;
+            stage1_options.elite_size = 5;
+            stage1_options.strategy_sample_size = 3;
+            stage1_options.top_strategy_count = 2;
+            stage1_options.convergence_window = 4;
+            stage1_options.convergence_tol = 5.0e-4;
+
+            gcopter::DPASASolverOptions stage2_options = stage1_options;
+            stage2_options.n_candidates = 18;
+            stage2_options.max_iterations = 18;
+            stage2_options.init_spatial_radius = 0.05;
+            stage2_options.init_time_radius = 0.08;
+            stage2_options.seed += 17u;
+
+            gcopter::DPASASolver stage1_solver(stage1_options);
+            const gcopter::DPASASolverResult stage1_result =
+                stage1_solver.optimize(ub, lb, layout, theta0, makeObjective(feasibility_time_cost, feasibility_cp_cost));
+
+            const Eigen::RowVectorXd stage2_seed =
+                stage1_result.best_position.size() == dim ? stage1_result.best_position : theta0;
+            gcopter::DPASASolver stage2_solver(stage2_options);
+            const gcopter::DPASASolverResult stage2_result =
+                stage2_solver.optimize(ub, lb, layout, stage2_seed, makeObjective(refinement_time_cost, refinement_cp_cost));
+
+            Eigen::RowVectorXd best_theta = theta0;
+            double final_cost = evaluateObjective(theta0, time_cost_, cp_cost_).total_cost;
+
+            auto try_update_best = [this, &best_theta, &final_cost](const Eigen::RowVectorXd &theta)
+            {
+                if (theta.size() == 0)
+                {
+                    return;
+                }
+                const double candidate_cost = evaluateObjective(theta, time_cost_, cp_cost_).total_cost;
+                if (std::isfinite(candidate_cost) && candidate_cost < final_cost)
+                {
+                    final_cost = candidate_cost;
+                    best_theta = theta;
+                }
+            };
+
+            try_update_best(stage1_result.best_position);
+            try_update_best(stage2_result.best_position);
+
+            final_cost = evaluateObjective(best_theta, time_cost_, cp_cost_).total_cost;
+            spline = optimizer_.getTrajectory();
+            return final_cost;
+        }
+
     public:
         bool setup(const double &timeWeight, const Eigen::Matrix3d &initialPVA, const Eigen::Matrix3d &terminalPVA,
                    const PolyhedraH &safeCorridor, const double &lengthPerPiece,
@@ -300,62 +653,62 @@ namespace gcopter
             // 恢复真实的物理上限（不再放宽）
             cp_cost_.max_v = magnitudeBd_(0) * 1.2;
             cp_cost_.max_thrust = magnitudeBd_(1) * 1.2;
-            cp_cost_.weight_v = penaltyWt_(0);
-            cp_cost_.weight_thrust = penaltyWt_(1);
-            cp_cost_.weight_pos = penaltyWt_.size() > 2 ? penaltyWt_(2) : 10000.0; 
+            cp_cost_.weight_pos = penaltyWt_.size() > 0 ? penaltyWt_(0) : 10000.0;
+            cp_cost_.weight_v = penaltyWt_.size() > 1 ? penaltyWt_(1) : 10000.0;
+            cp_cost_.weight_thrust = penaltyWt_.size() > 4 ? penaltyWt_(4) : 100000.0;
             cp_cost_.hPolys = &hPolytopes_;
             
             int p = optimizer_.getTrajectory().getP();
-            int nc = optimizer_.getTrajectory().getCtrlPtNum(pieceN_);
-            std::vector<std::vector<int>> mapping(nc);
-            for (int j = 0; j < nc; ++j) {
-                int primary_piece = std::max(0, std::min(pieceN_ - 1, j - p / 2));
-                mapping[j].push_back(hPolyIdx_(primary_piece));
+            cp_cost_.spline_degree = p;
+            std::vector<std::vector<int>> piece_mapping(pieceN_);
+            for (int piece = 0; piece < pieceN_; ++piece)
+            {
+                auto add_unique = [&](int poly_idx)
+                {
+                    if (poly_idx < 0)
+                    {
+                        return;
+                    }
+                    if (std::find(piece_mapping[piece].begin(),
+                                  piece_mapping[piece].end(),
+                                  poly_idx) == piece_mapping[piece].end())
+                    {
+                        piece_mapping[piece].push_back(poly_idx);
+                    }
+                };
+
+                add_unique(hPolyIdx_(piece));
+                for (int offset = 1; offset <= p; ++offset)
+                {
+                    if (piece - offset >= 0)
+                    {
+                        add_unique(hPolyIdx_(piece - offset));
+                    }
+                    if (piece + offset < pieceN_)
+                    {
+                        add_unique(hPolyIdx_(piece + offset));
+                    }
+                }
             }
-            cp_cost_.cp_to_polys = mapping;
+            cp_cost_.piece_to_polys = piece_mapping;
+            cp_cost_.cp_to_polys.clear();
             return true;
         }
 
         double optimize(TrajType &spline)
         {
             Eigen::VectorXd x0 = optimizer_.generateInitialGuess();
-            int dim = x0.size();
+            const Eigen::RowVectorXd theta0 = evaluatorToDecision(x0);
 
-            Eigen::VectorXd lb(dim);
-            Eigen::VectorXd ub(dim);
-            
-            // =========================================================
-            // 核心修改 3：物理锁死 ABC 的时间缩放边界
-            // =========================================================
-            lb(0) = 0.5;  // 允许时间最多压缩到 50%
-            ub(0) = 2.0;  // 允许时间最多拉长到 200%（杜绝拉到几十秒）
+            Eigen::VectorXd lb;
+            Eigen::VectorXd ub;
+            buildDecisionBounds(theta0, lb, ub);
 
-            // 空间边界放宽，给平滑算法留下空间
-            for(int i = 1; i < dim; ++i) { 
-                lb(i) = x0(i) - 1.0; 
-                ub(i) = x0(i) + 1.0;
+            if (backend_ == SolverBackend::ABC)
+            {
+                return optimizeWithABC(theta0, lb, ub, spline);
             }
-
-            auto objFunc = [this](const Eigen::RowVectorXd &x_row) -> std::pair<double, bool> {
-                Eigen::VectorXd x = x_row.transpose();
-                double cost = optimizer_.evaluate(x, time_cost_, cp_cost_);
-                return {std::isfinite(cost) ? cost : 1.0e10, std::isfinite(cost) && cost < 100000.0};
-            };
-
-            ABC abc;
-            // 降维后 ABC 压力骤减，只需极少的蜜蜂和代数
-            int nPop = 20;   
-            int MaxIt = 30;  
-            int priority_count = nPop / 2;
-            
-            abc.initializeWithPriority(nPop, MaxIt, ub, lb, dim, priority_count, 0.1, x0.transpose());
-            auto [bestCost, bestPos] = abc.optimize(nPop, MaxIt, ub, lb, dim, objFunc);
-
-            Eigen::VectorXd best_x = bestPos.transpose();
-            double final_cost = optimizer_.evaluate(best_x, time_cost_, cp_cost_);
-            spline = optimizer_.getTrajectory();
-
-            return final_cost;
+            return optimizeWithDPASA(theta0, lb, ub, spline);
         }
     };
 } 
