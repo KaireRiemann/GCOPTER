@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cfloat>
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace gcopter
@@ -23,7 +25,7 @@ namespace gcopter
     public:
         using TrajType = nubs::NUBSTrajectory<3, 7>;
         using OptimizerType = nubs::NUBSOptimizer<3, 7,
-                                                  nubs::QuadInvTimeMap,
+                                                  nubs::ScaleProfileTimeMap,
                                                   gcopter::PolytopeSpatialMap>;
 
         typedef Eigen::Matrix3Xd PolyhedronV;
@@ -60,6 +62,10 @@ namespace gcopter
 
         std::vector<double> ref_times_;
         Eigen::MatrixXd ref_waypoints_;
+        std::vector<double> base_time_alloc_;
+        Eigen::VectorXd base_time_vars_;
+        int time_var_dim_ = 0;
+        double time_weight_balance_gain_ = 1.0;
 
     private:
         static inline double costDistance(void *ptr,
@@ -296,205 +302,395 @@ namespace gcopter
         /**
          * @brief 初始化环境、提取初值、配置优化器参数
          */
-        bool setup(const double &timeWeight,
-                   const Eigen::Matrix3d &initialPVA,
-                   const Eigen::Matrix3d &terminalPVA,
-                   const PolyhedraH &safeCorridor,
-                   const double &lengthPerPiece,
-                   const double &smoothingFactor,
-                   const Eigen::VectorXd &magnitudeBounds,
-                   const Eigen::VectorXd &penaltyWeights,
-                   const Eigen::VectorXd &physicalParams) 
+        bool setup(const double &timeWeight, const Eigen::Matrix3d &initialPVA, const Eigen::Matrix3d &terminalPVA,
+                   const PolyhedraH &safeCorridor, const double &lengthPerPiece,
+                   const Eigen::VectorXd &magnitudeBounds, const Eigen::VectorXd &penaltyWeights) 
         {
-            headState_ = initialPVA;
-            tailState_ = terminalPVA;
-
-            hPolytopes_ = safeCorridor;
-            for (size_t i = 0; i < hPolytopes_.size(); i++)
-            {
-                const Eigen::ArrayXd norms = hPolytopes_[i].leftCols<3>().rowwise().norm();
-                hPolytopes_[i].array().colwise() /= norms;
+            headState_ = initialPVA; tailState_ = terminalPVA; hPolytopes_ = safeCorridor;
+            for (size_t i = 0; i < hPolytopes_.size(); i++) {
+                hPolytopes_[i].array().colwise() /= hPolytopes_[i].leftCols<3>().rowwise().norm().array();
             }
             if (!processCorridor(hPolytopes_, vPolytopes_)) return false;
 
             polyN_ = hPolytopes_.size();
-            smoothEps_ = smoothingFactor;
-            magnitudeBd_ = magnitudeBounds; // [max_vel, max_thrust, ...]
-            penaltyWt_ = penaltyWeights;    // [wt_vel, wt_thrust, ...]
-            allocSpeed_ = magnitudeBd_(0) * 3.0; 
-
-    
-            getShortestPath(headState_.col(0), tailState_.col(0), vPolytopes_, smoothEps_, shortPath_);
+            magnitudeBd_ = magnitudeBounds; penaltyWt_ = penaltyWeights;
             
+
+            double allocSpeed = magnitudeBd_(0) * 3.0; 
+
+            getShortestPath(headState_.col(0), tailState_.col(0), vPolytopes_, 0.1, shortPath_);
             const Eigen::Matrix3Xd deltas = shortPath_.rightCols(polyN_) - shortPath_.leftCols(polyN_);
             pieceIdx_ = (deltas.colwise().norm() / lengthPerPiece).cast<int>().transpose();
-            pieceIdx_.array() += 1;
-            pieceN_ = pieceIdx_.sum();
+            pieceIdx_.array() += 1; pieceN_ = pieceIdx_.sum();
 
-            vPolyIdx_.resize(pieceN_ - 1);
-            hPolyIdx_.resize(pieceN_);
+            vPolyIdx_.resize(pieceN_ - 1); hPolyIdx_.resize(pieceN_);
             for (int i = 0, j = 0, k; i < polyN_; i++) {
                 k = pieceIdx_(i);
                 for (int l = 0; l < k; l++, j++) {
-                    if (l < k - 1) vPolyIdx_(j) = 2 * i;
-                    else if (i < polyN_ - 1) vPolyIdx_(j) = 2 * i + 1;
+                    if (l < k - 1) vPolyIdx_(j) = 2 * i; else if (i < polyN_ - 1) vPolyIdx_(j) = 2 * i + 1;
                     hPolyIdx_(j) = i;
                 }
             }
 
             spatial_map_.reset(&vPolytopes_, &vPolyIdx_, pieceN_);
             optimizer_.setSpatialMap(&spatial_map_);
-            
             optimizer_.setEnergyWeights(1.0); 
+
             Eigen::MatrixXd waypoints(pieceN_ + 1, 3);
             waypoints.row(0) = headState_.col(0).transpose();
-
-            Eigen::Matrix3Xd innerPoints;
-            Eigen::VectorXd timeAlloc;
-            setInitial(shortPath_, allocSpeed_, pieceIdx_, innerPoints, timeAlloc);
-            for (int i = 0; i < innerPoints.cols(); ++i) {
-                waypoints.row(i + 1) = innerPoints.col(i).transpose();
-            }
+            Eigen::Matrix3Xd innerPoints; Eigen::VectorXd timeAlloc;
+            setInitial(shortPath_, allocSpeed, pieceIdx_, innerPoints, timeAlloc);
+            for (int i = 0; i < innerPoints.cols(); ++i) waypoints.row(i + 1) = innerPoints.col(i).transpose();
             waypoints.row(pieceN_) = tailState_.col(0).transpose();
 
-            // 注入到优化器中
-            if (!optimizer_.setInitState(std::vector<double>(timeAlloc.data(), timeAlloc.data() + timeAlloc.size()),
-                                         waypoints,
-                                         headState_,
-                                         tailState_))
+            // 缓存基准时间分配
+            base_time_alloc_ = std::vector<double>(timeAlloc.data(), timeAlloc.data() + timeAlloc.size());
+
+            if (!optimizer_.setInitState(base_time_alloc_, waypoints, headState_, tailState_)) return false;
+            base_time_vars_ = optimizer_.encodeTimeVariables(base_time_alloc_);
+            time_var_dim_ = base_time_vars_.size();
+
+            // 与 MINCO / ZO 版本保持一致：总代价中显式包含总时间正则项，
+            // 同时恢复速度/推力惩罚，避免目标只剩下“拉长时间压低能量/控制点罚项”。
+            time_cost_.weight = timeWeight;
+            cp_cost_.max_v = magnitudeBd_(0) * 1.2;
+            cp_cost_.max_thrust = magnitudeBd_(1) * 1.2;
+            cp_cost_.weight_pos = penaltyWt_.size() > 0 ? penaltyWt_(0) : 10000.0;
+            cp_cost_.weight_v = penaltyWt_.size() > 1 ? penaltyWt_(1) : 10000.0;
+            cp_cost_.weight_thrust = penaltyWt_.size() > 4 ? penaltyWt_(4) : 100000.0;
+            cp_cost_.hPolys = &hPolytopes_;
+            
+            int p = optimizer_.getTrajectory().getP();
+            cp_cost_.spline_degree = p;
+            std::vector<std::vector<int>> piece_mapping(pieceN_);
+            for (int piece = 0; piece < pieceN_; ++piece)
+            {
+                auto add_unique = [&](int poly_idx)
+                {
+                    if (poly_idx < 0)
+                    {
+                        return;
+                    }
+                    if (std::find(piece_mapping[piece].begin(),
+                                  piece_mapping[piece].end(),
+                                  poly_idx) == piece_mapping[piece].end())
+                    {
+                        piece_mapping[piece].push_back(poly_idx);
+                    }
+                };
+
+                add_unique(hPolyIdx_(piece));
+                for (int offset = 1; offset <= p; ++offset)
+                {
+                    if (piece - offset >= 0)
+                    {
+                        add_unique(hPolyIdx_(piece - offset));
+                    }
+                    if (piece + offset < pieceN_)
+                    {
+                        add_unique(hPolyIdx_(piece + offset));
+                    }
+                }
+            }
+            cp_cost_.piece_to_polys = piece_mapping;
+            cp_cost_.cp_to_polys.clear();
+
+            // 当前 NUBS surrogate 的 cp/energy 项通常比线性时间项大数百到数千倍。
+            // 这里用参考初值做一次量级校准，让时间项在起点附近至少进入同一数量级，
+            // 否则总目标会在很大时间范围内近似单调下降，难以形成像 MINCO 那样的最优时间尺度。
+            time_weight_balance_gain_ = 1.0;
+            {
+                const Eigen::VectorXd x_ref = optimizer_.generateInitialGuess();
+                const DecisionDiagnostic ref_diag = diagnoseDecision(x_ref);
+                const double raw_time_cost = std::max(ref_diag.time_cost, 1.0e-6);
+                const double target_time_cost = std::max(1.0e3, 0.25 * (std::max(0.0, ref_diag.cp_cost) +
+                                                                        std::max(0.0, ref_diag.energy_cost)));
+                time_weight_balance_gain_ = std::clamp(target_time_cost / raw_time_cost, 1.0, 2000.0);
+                time_cost_.weight = timeWeight * time_weight_balance_gain_;
+            }
+            return true;
+        }
+
+        // 供 L-BFGS 调用的目标函数：彻底剔除时间的联合优化
+        static inline double costSpatialOnly(void *ptr, const Eigen::VectorXd &x_spatial, Eigen::VectorXd &grad_spatial)
+        {
+            auto *obj = static_cast<NUBSSFCOptimizer*>(ptr);
+            
+            // 构造全量 x 向量（将缓存的固定时间拼接在前面，欺骗底层 evaluater）
+            Eigen::VectorXd x_full(obj->time_var_dim_ + x_spatial.size());
+            x_full.head(obj->time_var_dim_) = obj->base_time_vars_;
+            x_full.tail(x_spatial.size()) = x_spatial;
+
+            Eigen::VectorXd grad_full(x_full.size());
+            // 调用底层一阶优化器的代价与梯度计算
+            double cost = obj->optimizer_.evaluate(x_full, grad_full, obj->time_cost_, obj->cp_cost_);
+            
+            // 截断梯度，只将空间变量的梯度返回给 L-BFGS
+            grad_spatial = grad_full.tail(x_spatial.size());
+            return cost;
+        }
+
+        Eigen::VectorXd buildDecisionFromScaledTimes(const Eigen::VectorXd &x_spatial,
+                                                     const std::vector<double> &times,
+                                                     double scale) const
+        {
+            std::vector<double> scaled_times = times;
+            for (double &t : scaled_times)
+            {
+                t *= scale;
+            }
+            return composeDecision(scaled_times, x_spatial);
+        }
+
+        double optimize(TrajType &spline)
+        {
+            // 1. 获取初始猜想，分离出纯空间变量
+            Eigen::VectorXd x0_full = optimizer_.generateInitialGuess();
+            Eigen::VectorXd x_spatial = x0_full.tail(x0_full.size() - time_var_dim_);
+
+
+            lbfgs::lbfgs_parameter_t lbfgs_params;
+            lbfgs_params.mem_size = 16;
+            lbfgs_params.past = 3;
+            lbfgs_params.g_epsilon = 1.0e-5;
+            lbfgs_params.min_step = 1.0e-32;
+            lbfgs_params.delta = 1.0e-4;
+            lbfgs_params.max_iterations = 400; // 在强凸地形下，通常 10 步内收敛
+            
+            double min_cost = 0.0;
+            int ret = lbfgs::lbfgs_optimize(x_spatial, min_cost, &NUBSSFCOptimizer::costSpatialOnly, nullptr, nullptr, this, lbfgs_params);
+            (void)ret;
+
+            // 2. 固定空间变量，对全局时间尺度做一维扫描，找到更合理的联合优化初值
+            Eigen::VectorXd x_full_seed = composeDecision(base_time_alloc_, x_spatial);
+            DecisionDiagnostic best_diag = diagnoseDecision(x_full_seed);
+            constexpr int kScaleSamples = 80;
+            constexpr double kScaleMin = 0.4;
+            constexpr double kScaleMax = 3.0;
+            for (int i = 0; i < kScaleSamples; ++i)
+            {
+                const double alpha = static_cast<double>(i) / static_cast<double>(kScaleSamples - 1);
+                const double scale = kScaleMin + (kScaleMax - kScaleMin) * alpha;
+                Eigen::VectorXd x_candidate = buildDecisionFromScaledTimes(x_spatial, base_time_alloc_, scale);
+                const DecisionDiagnostic diag = diagnoseDecision(x_candidate);
+                if (diag.cost_finite && (!best_diag.cost_finite || diag.total_cost < best_diag.total_cost))
+                {
+                    best_diag = diag;
+                    x_full_seed = x_candidate;
+                }
+            }
+
+            // 3. 从 scale-scan 的最佳种子出发做时空联合优化
+            Eigen::VectorXd x_full_best = x_full_seed;
+            double final_cost = best_diag.total_cost;
+            const int full_ret = lbfgs::lbfgs_optimize(x_full_best,
+                                                       final_cost,
+                                                       &NUBSSFCOptimizer::costFunctional,
+                                                       nullptr,
+                                                       nullptr,
+                                                       this,
+                                                       lbfgs_params);
+
+            if (full_ret >= 0 && std::isfinite(final_cost))
+            {
+                Eigen::VectorXd dummy_grad = Eigen::VectorXd::Zero(x_full_best.size());
+                optimizer_.evaluate(x_full_best, dummy_grad, time_cost_, cp_cost_);
+            }
+            else
+            {
+                Eigen::VectorXd dummy_grad = Eigen::VectorXd::Zero(x_full_seed.size());
+                optimizer_.evaluate(x_full_seed, dummy_grad, time_cost_, cp_cost_);
+                final_cost = best_diag.total_cost;
+            }
+
+            // 获取联合优化后的轨迹
+            spline = optimizer_.getTrajectory();
+
+            // =========================================================
+            // 4. 后端解析时间重缩放 (Analytical Time Rescaling)
+            // =========================================================
+            const auto& C = spline.getControlPoints();
+            const auto& u = spline.getKnots();
+            int p = spline.getP();
+            int n = C.rows();
+
+            double max_v_sq_actual = 0.0;
+            double max_a_sq_actual = 0.0;
+
+            // 计算该曲线产生的最大控制点速度和加速度
+            Eigen::MatrixXd V(std::max(0, n - 1), 3);
+            for (int i = 0; i < n - 1; ++i) {
+                double dt = u(i + p + 1) - u(i + 1);
+                if (dt > 1e-9) V.row(i) = (p / dt) * (C.row(i + 1) - C.row(i)); else V.row(i).setZero();
+                max_v_sq_actual = std::max(max_v_sq_actual, V.row(i).squaredNorm());
+            }
+
+            for (int i = 0; i < n - 2; ++i) {
+                double dt = u(i + p + 1) - u(i + 2);
+                Eigen::Vector3d A_i = Eigen::Vector3d::Zero();
+                if (dt > 1e-9) A_i = ((p - 1) / dt) * (V.row(i + 1).transpose() - V.row(i).transpose()); 
+                Eigen::Vector3d total_thrust = A_i + cp_cost_.gravity;
+                max_a_sq_actual = std::max(max_a_sq_actual, total_thrust.squaredNorm());
+            }
+
+            // 计算时间缩放因子
+            double v_limit = magnitudeBd_(0);
+            double a_limit = magnitudeBd_(1);
+            
+            double k_v = std::sqrt(max_v_sq_actual) / v_limit;
+            double k_a = std::sqrt(std::sqrt(max_a_sq_actual) / a_limit); // 注意推力与时间的关系是平方
+
+            // 获取确保安全的最大缩放因子
+            double k_time = std::max({1.0, k_v, k_a});
+
+            // 如果发生动力学越界，执行解析缩放
+            if (k_time > 1.0) {
+                const Eigen::VectorXd x_spatial_final = x_full_best.tail(x_full_best.size() - time_var_dim_);
+                const Eigen::VectorXd &durations = spline.getDurations();
+                std::vector<double> final_times(durations.data(), durations.data() + durations.size());
+                Eigen::VectorXd x_final_full = buildDecisionFromScaledTimes(x_spatial_final, final_times, k_time);
+                
+                // 仅为了更新内部样条状态，调用一次 evaluate
+                Eigen::VectorXd dummy_grad(x_final_full.size());
+                optimizer_.evaluate(x_final_full, dummy_grad, time_cost_, cp_cost_);
+                spline = optimizer_.getTrajectory();
+            }
+
+            return final_cost;
+        }
+
+        struct DecisionDiagnostic
+        {
+            double total_cost = std::numeric_limits<double>::quiet_NaN();
+            double spatial_penalty = std::numeric_limits<double>::quiet_NaN();
+            double energy_cost = std::numeric_limits<double>::quiet_NaN();
+            double time_cost = std::numeric_limits<double>::quiet_NaN();
+            double cp_cost = std::numeric_limits<double>::quiet_NaN();
+            double grad_norm = std::numeric_limits<double>::quiet_NaN();
+            double min_segment_time = std::numeric_limits<double>::quiet_NaN();
+            double total_duration = std::numeric_limits<double>::quiet_NaN();
+            bool cost_finite = false;
+            bool grad_finite = false;
+            bool knots_finite = false;
+            bool control_points_finite = false;
+        };
+
+        int getTimeVariableDim() const
+        {
+            return time_var_dim_;
+        }
+
+        Eigen::VectorXd getFullInitialGuess() const
+        {
+            return optimizer_.generateInitialGuess();
+        }
+
+        Eigen::VectorXd encodeTimeDecision(const std::vector<double> &times) const
+        {
+            return optimizer_.encodeTimeVariables(times);
+        }
+
+        Eigen::VectorXd composeDecision(const std::vector<double> &times,
+                                        const Eigen::VectorXd &spatial_vars) const
+        {
+            Eigen::VectorXd x(time_var_dim_ + spatial_vars.size());
+            x.head(time_var_dim_) = optimizer_.encodeTimeVariables(times);
+            x.tail(spatial_vars.size()) = spatial_vars;
+            return x;
+        }
+
+        double evaluateDecision(const Eigen::VectorXd &x, Eigen::VectorXd &grad)
+        {
+            return optimizer_.evaluate(x, grad, time_cost_, cp_cost_);
+        }
+
+        DecisionDiagnostic diagnoseDecision(const Eigen::VectorXd &x)
+        {
+            DecisionDiagnostic diag;
+            Eigen::VectorXd grad = Eigen::VectorXd::Zero(x.size());
+            diag.total_cost = optimizer_.evaluate(x, grad, time_cost_, cp_cost_);
+            diag.cost_finite = std::isfinite(diag.total_cost);
+            diag.grad_finite = grad.allFinite();
+            if (diag.grad_finite)
+            {
+                diag.grad_norm = grad.norm();
+            }
+
+            const auto &traj = optimizer_.getTrajectory();
+            const auto &durations = traj.getDurations();
+            if (durations.size() > 0 && durations.allFinite())
+            {
+                diag.min_segment_time = durations.minCoeff();
+                diag.total_duration = durations.sum();
+            }
+
+            diag.knots_finite = traj.getKnots().allFinite();
+            diag.control_points_finite = traj.getControlPoints().allFinite();
+            diag.energy_cost = traj.getEnergy();
+
+            std::vector<double> Ts(durations.data(), durations.data() + durations.size());
+            Eigen::VectorXd dummy_grad_t = Eigen::VectorXd::Zero(Ts.size());
+            diag.time_cost = time_cost_(Ts, dummy_grad_t);
+
+            diag.spatial_penalty = 0.0;
+            int offset = time_var_dim_;
+            for (int i = 1; i < pieceN_; ++i)
+            {
+                const int dof = spatial_map_.getUnconstrainedDim(i);
+                Eigen::VectorXd xi = x.segment(offset, dof);
+                Eigen::VectorXd dummy_grad_xi = Eigen::VectorXd::Zero(dof);
+                spatial_map_.addNormPenalty(xi, diag.spatial_penalty, dummy_grad_xi);
+                offset += dof;
+            }
+
+            if (diag.cost_finite && std::isfinite(diag.energy_cost) &&
+                std::isfinite(diag.time_cost) && std::isfinite(diag.spatial_penalty))
+            {
+                diag.cp_cost = diag.total_cost - diag.energy_cost - diag.time_cost - diag.spatial_penalty;
+            }
+
+            return diag;
+        }
+
+        void decisionToTrajectory(const Eigen::VectorXd &x, TrajType &spline)
+        {
+            Eigen::VectorXd dummy_grad = Eigen::VectorXd::Zero(x.size());
+            optimizer_.evaluate(x, dummy_grad, time_cost_, cp_cost_);
+            spline = optimizer_.getTrajectory();
+        }
+
+        bool trajectoryToDecision(const TrajType &traj, Eigen::VectorXd &x) const
+        {
+            if (traj.getPieceNum() != pieceN_)
             {
                 return false;
             }
 
-            time_cost_.weight = timeWeight;
-            const double overshoot_protection = 4.5;
-            
-            cp_cost_.max_v = magnitudeBd_(0) * overshoot_protection;
-            cp_cost_.max_thrust = magnitudeBd_(1) * overshoot_protection ;
-            cp_cost_.weight_v = penaltyWt_(0);
-            cp_cost_.weight_thrust = penaltyWt_(1);
-            cp_cost_.weight_pos = penaltyWt_.size() > 2 ? penaltyWt_(2) : 10000.0; 
-            cp_cost_.smooth_eps = smoothEps_;
-            cp_cost_.hPolys = &hPolytopes_;
-            
-            int p = optimizer_.getTrajectory().getP();
-            int nc = optimizer_.getTrajectory().getCtrlPtNum(pieceN_);
-            std::vector<std::vector<int>> mapping(nc);
-            
-            for (int j = 0; j < nc; ++j) 
+            const Eigen::VectorXd &durations = traj.getDurations();
+            std::vector<double> times(durations.data(), durations.data() + durations.size());
+
+            const int dim_T = time_var_dim_;
+            int dim_P = 0;
+            for (int i = 1; i < pieceN_; ++i)
             {
-                int primary_piece = j - p / 2;
-                
-                primary_piece = std::max(0, std::min(pieceN_ - 1, primary_piece));
-                
-                mapping[j].push_back(hPolyIdx_(primary_piece));
+                dim_P += spatial_map_.getUnconstrainedDim(i);
             }
-            cp_cost_.cp_to_polys = mapping;
+
+            x.resize(dim_T + dim_P);
+            x.head(dim_T) = optimizer_.encodeTimeVariables(times);
+
+            double t_cum = 0.0;
+            int offset = dim_T;
+            for (int i = 1; i < pieceN_; ++i)
+            {
+                t_cum += durations(i - 1);
+                const Eigen::Vector3d waypoint = traj.evaluate(t_cum, 0);
+                const int dof = spatial_map_.getUnconstrainedDim(i);
+                x.segment(offset, dof) = spatial_map_.toUnconstrained(waypoint, i);
+                offset += dof;
+            }
 
             return true;
-        }
-
-        /**
-         * @brief 执行主优化逻辑
-         */
-        double optimize(TrajType &spline, const double &relCostTol)
-        {
-            Eigen::VectorXd x = optimizer_.generateInitialGuess();
-
-            double minCostFunctional = 0.0;
-            lbfgs_params_.mem_size = 256;
-            lbfgs_params_.past = 3;
-            lbfgs_params_.min_step = 1.0e-32;
-            lbfgs_params_.g_epsilon = 0.0;
-            lbfgs_params_.delta = relCostTol;
-
-            const char *grad_check_env = std::getenv("GCOPTER_GRAD_CHECK");
-            if (grad_check_env && std::string(grad_check_env) == "1")
-            {
-                struct ZeroTimeCost {
-                    double operator()(const std::vector<double> &/*Ts*/, Eigen::VectorXd &grad) const {
-                        grad.setZero();
-                        return 0.0;
-                    }
-                };
-
-                auto zero_cp = [](const Eigen::MatrixXd &/*C*/,const Eigen::MatrixXd &/*V*/, const Eigen::MatrixXd &/*A*/, const Eigen::MatrixXd &/*J*/,
-                                  double &cost, Eigen::MatrixXd &/*gdC*/, Eigen::MatrixXd &/*gdV*/, Eigen::MatrixXd &/*gdA*/, Eigen::MatrixXd &/*gdJ*/)
-                {
-                    cost = 0.0;
-                };
-
-                auto run_check = [&](const char *tag,
-                                     auto &&time_func,
-                                     auto &&cp_func,
-                                     double energy_weight)
-                {
-                    optimizer_.setEnergyWeights(energy_weight);
-                    auto check = optimizer_.checkGradients(
-                        x,
-                        std::forward<decltype(time_func)>(time_func),
-                        std::forward<decltype(cp_func)>(cp_func));
-                        
-                    std::cerr << "[GradCheck] " << tag << " -> " << check.makeReport();
-                    std::cerr << "[GradCheck] " << tag << " rel error: " << check.rel_error
-                              << " | norm: " << check.error_norm << std::endl;
-                              
-                    if (check.analytical.size() == check.numerical.size() && check.analytical.size() > 0)
-                    {
-                        const int time_dim = pieceN_;
-                        const int total_dim = static_cast<int>(check.analytical.size());
-                        const int spatial_dim = std::max(0, total_dim - time_dim);
-
-                        if (time_dim > 0 && total_dim >= time_dim) {
-                            Eigen::VectorXd diff = check.analytical - check.numerical;
-                            double time_err = diff.head(time_dim).norm();
-                            double time_norm = check.analytical.head(time_dim).norm();
-                            double time_rel = (time_norm > 1e-9) ? (time_err / time_norm) : time_err;
-                            std::cerr << "[GradCheck] " << tag << " time rel: " << time_rel << " | time norm: " << time_err << std::endl;
-                        }
-
-                        if (spatial_dim > 0) {
-                            Eigen::VectorXd diff = check.analytical - check.numerical;
-                            double spatial_err = diff.tail(spatial_dim).norm();
-                            double spatial_norm = check.analytical.tail(spatial_dim).norm();
-                            double spatial_rel = (spatial_norm > 1e-9) ? (spatial_err / spatial_norm) : spatial_err;
-                            std::cerr << "[GradCheck] " << tag << " spatial rel: " << spatial_rel << " | spatial norm: " << spatial_err << std::endl;
-                        }
-                    }
-                    std::cerr.flush();
-                };
-
-                run_check("ALL (time+cp+energy)", time_cost_, cp_cost_, 1.0);
-                run_check("TIME ONLY", time_cost_, zero_cp, 0.0);
-                run_check("CP ONLY (Penalty)", ZeroTimeCost(), cp_cost_, 0.0);
-                run_check("ENERGY ONLY (Min-Jerk)", ZeroTimeCost(), zero_cp, 1.0);
-
-                optimizer_.setEnergyWeights(1.0);
-            }
-
-            const int ret = lbfgs::lbfgs_optimize(x,
-                                                  minCostFunctional,
-                                                  &NUBSSFCOptimizer::costFunctional,
-                                                  nullptr,
-                                                  nullptr,
-                                                  this,
-                                                  lbfgs_params_);
-
-            if (ret >= 0)
-            {
-                Eigen::VectorXd grad(x.size());
-                // 确保在最优参数处，提取一次最终轨迹
-                minCostFunctional = optimizer_.evaluate(x, grad, time_cost_, cp_cost_);
-                spline = optimizer_.getTrajectory();
-            }
-            else
-            {
-                spline = TrajType();
-                minCostFunctional = INFINITY;
-                std::cout << "NUBS Optimization Failed: " << lbfgs::lbfgs_strerror(ret) << std::endl;
-            }
-
-            return minCostFunctional;
         }
     };
 

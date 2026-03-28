@@ -11,6 +11,7 @@
 #include <memory>
 #include <type_traits>
 #include <iostream>
+#include <algorithm>
 
 namespace nubs
 {
@@ -28,9 +29,13 @@ namespace nubs
 
         template <typename T>
         struct HasTimeMapInterface<T, void_t<
-            decltype(static_cast<double>(std::declval<T>().toTime(std::declval<double>()))),
-            decltype(static_cast<double>(std::declval<T>().toTau(std::declval<double>()))),
-            decltype(static_cast<double>(std::declval<T>().backward(std::declval<double>(), std::declval<double>(), std::declval<double>())))
+            decltype(static_cast<int>(std::declval<T>().getVariableDim(std::declval<int>()))),
+            decltype(std::declval<T>().toOptimizationVariables(std::declval<const std::vector<double>&>())),
+            decltype(std::declval<T>().toPhysicalTimes(std::declval<const Eigen::VectorXd&>(), std::declval<Eigen::VectorXd&>())),
+            decltype(std::declval<T>().backward(std::declval<const Eigen::VectorXd&>(),
+                                                std::declval<const Eigen::VectorXd&>(),
+                                                std::declval<const Eigen::VectorXd&>(),
+                                                std::declval<Eigen::VectorXd&>()))
         >> : std::true_type {};
 
         // --- SpatialMap Traits ---
@@ -69,6 +74,40 @@ namespace nubs
         double toTime(double tau) const { return tau; }
         double toTau(double T) const { return T; }
         double backward(double tau, double T, double gradT) const { return gradT; }
+
+        int getVariableDim(int num_segments) const { return num_segments; }
+
+        Eigen::VectorXd toOptimizationVariables(const std::vector<double> &T) const
+        {
+            Eigen::VectorXd tau(T.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                tau(i) = toTau(T[i]);
+            }
+            return tau;
+        }
+
+        void toPhysicalTimes(const Eigen::VectorXd &tau,
+                             Eigen::VectorXd &T) const
+        {
+            T.resize(tau.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                T(i) = toTime(tau(i));
+            }
+        }
+
+        void backward(const Eigen::VectorXd &tau,
+                      const Eigen::VectorXd &T,
+                      const Eigen::VectorXd &gradT,
+                      Eigen::VectorXd &gradTau) const
+        {
+            gradTau.resize(tau.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                gradTau(i) = backward(tau(i), T(i), gradT(i));
+            }
+        }
     };
 
     struct QuadInvTimeMap
@@ -83,6 +122,145 @@ namespace nubs
             if (tau > 0) return gradT * (tau + 1.0);
             double den = (0.5 * tau - 1.0) * tau + 1.0;
             return gradT * (1.0 - tau) / (den * den);
+        }
+
+        int getVariableDim(int num_segments) const { return num_segments; }
+
+        Eigen::VectorXd toOptimizationVariables(const std::vector<double> &T) const
+        {
+            Eigen::VectorXd tau(T.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                tau(i) = toTau(T[i]);
+            }
+            return tau;
+        }
+
+        void toPhysicalTimes(const Eigen::VectorXd &tau,
+                             Eigen::VectorXd &T) const
+        {
+            T.resize(tau.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                T(i) = toTime(tau(i));
+            }
+        }
+
+        void backward(const Eigen::VectorXd &tau,
+                      const Eigen::VectorXd &T,
+                      const Eigen::VectorXd &gradT,
+                      Eigen::VectorXd &gradTau) const
+        {
+            gradTau.resize(tau.size());
+            for (int i = 0; i < tau.size(); ++i)
+            {
+                gradTau(i) = backward(tau(i), T(i), gradT(i));
+            }
+        }
+    };
+
+    struct ScaleProfileTimeMap
+    {
+        QuadInvTimeMap scale_map_;
+
+        int getVariableDim(int num_segments) const
+        {
+            return num_segments > 0 ? num_segments : 0;
+        }
+
+        Eigen::VectorXd toOptimizationVariables(const std::vector<double> &T) const
+        {
+            const int num_segments = static_cast<int>(T.size());
+            Eigen::VectorXd tau = Eigen::VectorXd::Zero(getVariableDim(num_segments));
+            if (num_segments <= 0)
+            {
+                return tau;
+            }
+
+            double total_time = 0.0;
+            for (double t : T)
+            {
+                total_time += t;
+            }
+            total_time = std::max(total_time, 1.0e-8);
+            tau(0) = scale_map_.toTau(total_time);
+
+            if (num_segments == 1)
+            {
+                return tau;
+            }
+
+            constexpr double kMinAlpha = 1.0e-8;
+            Eigen::VectorXd alpha(num_segments);
+            for (int i = 0; i < num_segments; ++i)
+            {
+                alpha(i) = std::max(T[i] / total_time, kMinAlpha);
+            }
+            alpha /= alpha.sum();
+
+            const double anchor = std::log(alpha(num_segments - 1));
+            for (int i = 0; i < num_segments - 1; ++i)
+            {
+                tau(1 + i) = std::log(alpha(i)) - anchor;
+            }
+            return tau;
+        }
+
+        void toPhysicalTimes(const Eigen::VectorXd &tau,
+                             Eigen::VectorXd &T) const
+        {
+            const int num_segments = tau.size();
+            T.resize(num_segments);
+            if (num_segments <= 0)
+            {
+                return;
+            }
+
+            const double total_time = scale_map_.toTime(tau(0));
+            if (num_segments == 1)
+            {
+                T(0) = total_time;
+                return;
+            }
+
+            Eigen::VectorXd logits(num_segments);
+            logits.head(num_segments - 1) = tau.tail(num_segments - 1);
+            logits(num_segments - 1) = 0.0;
+            const double max_logit = logits.maxCoeff();
+            Eigen::VectorXd exp_logits = (logits.array() - max_logit).exp();
+            const double exp_sum = exp_logits.sum();
+            const Eigen::VectorXd alpha = exp_logits / exp_sum;
+
+            T = total_time * alpha;
+        }
+
+        void backward(const Eigen::VectorXd &tau,
+                      const Eigen::VectorXd &T,
+                      const Eigen::VectorXd &gradT,
+                      Eigen::VectorXd &gradTau) const
+        {
+            const int num_segments = T.size();
+            gradTau.resize(getVariableDim(num_segments));
+            if (num_segments <= 0)
+            {
+                return;
+            }
+
+            const double total_time = std::max(T.sum(), 1.0e-8);
+            const Eigen::VectorXd alpha = T / total_time;
+            const double grad_scale = gradT.dot(alpha);
+            gradTau(0) = scale_map_.backward(tau(0), total_time, grad_scale);
+
+            if (num_segments == 1)
+            {
+                return;
+            }
+
+            const double centered_grad = grad_scale;
+            for (int i = 0; i < num_segments - 1; ++i)
+            {
+                gradTau(1 + i) = total_time * alpha(i) * (gradT(i) - centered_grad);
+            }
         }
     };
 
@@ -223,7 +401,7 @@ namespace nubs
     //  通用 NUBS 求解器引擎 NUBSOptimizer
     // =========================================================================
     template <int DIM, int MAX_P = 7,
-              typename TimeMap = nubs::QuadInvTimeMap,           
+              typename TimeMap = nubs::ScaleProfileTimeMap,
               typename SpatialMap = gcopter::PolytopeSpatialMap> 
     class NUBSOptimizer
     {
@@ -278,6 +456,8 @@ namespace nubs
         NUBSOptimizer(int sys_order = 3) : traj_(sys_order), s_(sys_order) 
         {
             ws_ = std::make_unique<Workspace>();
+            active_time_map_ = &default_time_map_;
+            active_spatial_map_ = &default_spatial_map_;
         }
 
         void setEnergyWeights(double rho) { rho_energy_ = rho; }
@@ -289,6 +469,16 @@ namespace nubs
         void setSpatialMap(const SpatialMap* sm) 
         { 
             active_spatial_map_ = (sm != nullptr) ? sm : &default_spatial_map_;
+        }
+
+        int getTimeVariableDim() const
+        {
+            return active_time_map_->getVariableDim(num_segments_);
+        }
+
+        Eigen::VectorXd encodeTimeVariables(const std::vector<double> &time_segments) const
+        {
+            return active_time_map_->toOptimizationVariables(time_segments);
         }
 
         /**
@@ -325,17 +515,14 @@ namespace nubs
          */
         Eigen::VectorXd generateInitialGuess() const
         {
-            int dim_T = num_segments_;
+            const int dim_T = getTimeVariableDim();
             int dim_P = 0;
             for (int i = 1; i < num_segments_; ++i) {
                 dim_P += active_spatial_map_->getUnconstrainedDim(i);
             }
 
             Eigen::VectorXd x(dim_T + dim_P);
-
-            for (int i = 0; i < num_segments_; ++i) {
-                x(i) = active_time_map_->toTau(ref_times_[i]);
-            }
+            x.head(dim_T) = active_time_map_->toOptimizationVariables(ref_times_);
 
             int offset = dim_T;
             for (int i = 1; i < num_segments_; ++i) {
@@ -362,12 +549,10 @@ namespace nubs
             double total_cost = 0.0;
             grad_out.setZero();
 
-            for (int i = 0; i < num_segments_; ++i) 
-            {
-                ws_->cache_T(i) = active_time_map_->toTime(x(i));
-            }
+            const int dim_T = getTimeVariableDim();
+            active_time_map_->toPhysicalTimes(x.head(dim_T), ws_->cache_T);
 
-            int offset = num_segments_;
+            int offset = dim_T;
             for (int i = 1; i < num_segments_; ++i) 
             {
                 int dof = active_spatial_map_->getUnconstrainedDim(i);
@@ -419,13 +604,11 @@ namespace nubs
 
             
             traj_.propagateGrad(gdC_total, gdT_direct_total, ws_->cache_T, ws_->gradByPoints, ws_->gradByTimes);
+            Eigen::VectorXd grad_time = Eigen::VectorXd::Zero(dim_T);
+            active_time_map_->backward(x.head(dim_T), ws_->cache_T, ws_->gradByTimes, grad_time);
+            grad_out.head(dim_T) += grad_time;
 
-            for (int i = 0; i < num_segments_; ++i) 
-            {
-                grad_out(i) += active_time_map_->backward(x(i), ws_->cache_T(i), ws_->gradByTimes(i));
-            }
-
-            offset = num_segments_;
+            offset = dim_T;
             for (int i = 1; i < num_segments_; ++i) {
                 int dof = active_spatial_map_->getUnconstrainedDim(i);
                 Eigen::Matrix<double, DIM, 1> grad_p = ws_->gradByPoints.row(i - 1).transpose();
